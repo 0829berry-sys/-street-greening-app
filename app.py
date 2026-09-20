@@ -313,7 +313,11 @@ def build_aruco_match_message(point_id, ids_found):
         return "未偵測到 ArUco 標記", "未偵測到"
 
     id_str = "、".join(str(i) for i in ids_found)
-    point_id_clean = (point_id or "").strip()
+    # point_id 可能來自表單文字輸入（str），也可能來自 Excel 匯入（int/float/numpy 數值型別），
+    # 這裡一律先轉成字串再處理，避免數值型別沒有 .strip() 方法而出錯。
+    point_id_clean = "" if point_id is None else str(point_id).strip()
+    if point_id_clean.endswith(".0"):
+        point_id_clean = point_id_clean[:-2]  # Excel 數字欄位可能變成 "1.0" 這種形式，去除多餘的 .0
 
     try:
         point_id_num = int(point_id_clean)
@@ -657,7 +661,10 @@ def parse_template_excel(file_bytes):
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
         df = df.dropna(subset=["點位編號"])
-        df = df[df["點位編號"].astype(str).str.strip() != ""]
+        df["點位編號"] = df["點位編號"].apply(
+            lambda v: str(v)[:-2] if isinstance(v, float) and str(v).endswith(".0") else str(v)
+        ).str.strip()
+        df = df[df["點位編號"] != ""]
 
         records = df[TEMPLATE_COLUMNS].to_dict(orient="records")
         return records, None
