@@ -28,6 +28,7 @@ Streamlit + OpenCV 電腦視覺應用程式
 import io
 import os
 import zipfile
+import hashlib
 from datetime import datetime
 
 import cv2
@@ -125,6 +126,15 @@ HEIGHT_LEVEL_THRESHOLD_DEFAULT = 5.0  # 公分，判斷「高/低」是否有顯
 
 LOCATION_OPTIONS = ["路邊", "門口", "路口轉角", "騎樓", "其他"]
 ARRANGEMENT_OPTIONS = ["橫向擺放", "直列擺放", "群聚擺放", "單盆擺放"]
+
+# 批次匯入 Excel 範本欄位：只包含「人工填寫」的屬性，不含 AI 計算出來的欄位（那些要等上傳照片、執行分析後才會產生）
+TEMPLATE_COLUMNS = [
+    "捷運站", "點位編號", "拍照距離(m)", "擺放位置", "盆栽擺放型態",
+    "落地擺放高度(cm)", "吊掛擺放高度(cm)", "向上擺放高度(cm)",
+    "盆栽占用深度(cm)",
+    "落地擺放數量", "吊掛擺放數量", "向上擺放數量", "空盆栽數量",
+    "ArUco邊長(cm)", "附註",
+]
 
 CANVAS_MAX_WIDTH = 850  # 彈出視窗中編輯畫布的最大寬度（像素）
 REFERENCE_THUMB_MAX_WIDTH = 240  # 彈出視窗中「原始照片」參考縮圖的最大寬度
@@ -255,8 +265,28 @@ def init_session_state():
         st.session_state.editing_mode = False
     if "canvas_key_counter" not in st.session_state:
         st.session_state.canvas_key_counter = 0
+    if "mask_before_editing" not in st.session_state:
+        st.session_state.mask_before_editing = None
+    if "last_canvas_data_hash" not in st.session_state:
+        st.session_state.last_canvas_data_hash = None
     if "height_threshold_cm" not in st.session_state:
         st.session_state.height_threshold_cm = HEIGHT_LEVEL_THRESHOLD_DEFAULT
+    if "pending_records" not in st.session_state:
+        st.session_state.pending_records = []
+    if "pending_id_counter" not in st.session_state:
+        st.session_state.pending_id_counter = 0
+    if "batch_pending_id" not in st.session_state:
+        st.session_state.batch_pending_id = None
+    if "batch_image_bgr" not in st.session_state:
+        st.session_state.batch_image_bgr = None
+    if "batch_mask" not in st.session_state:
+        st.session_state.batch_mask = None
+    if "batch_pixels_per_cm" not in st.session_state:
+        st.session_state.batch_pixels_per_cm = None
+    if "batch_result" not in st.session_state:
+        st.session_state.batch_result = None
+    if "batch_match_msg" not in st.session_state:
+        st.session_state.batch_match_msg = ""
 
 
 # ----------------------------------------------------------------------------
@@ -576,6 +606,65 @@ def df_to_excel_bytes(df):
     return buffer.getvalue()
 
 
+def build_template_excel_bytes():
+    """產生批次匯入用的 Excel 範本，含一行範例與一張欄位選項說明表。"""
+    example_row = {
+        "捷運站": "忠孝復興站", "點位編號": "A01", "拍照距離(m)": 3.0,
+        "擺放位置": "路邊", "盆栽擺放型態": "橫向擺放",
+        "落地擺放高度(cm)": 60, "吊掛擺放高度(cm)": 0, "向上擺放高度(cm)": 0,
+        "盆栽占用深度(cm)": 40,
+        "落地擺放數量": 5, "吊掛擺放數量": 0, "向上擺放數量": 0, "空盆栽數量": 1,
+        "ArUco邊長(cm)": 20, "附註": "範例列，請刪除後填入自己的資料",
+    }
+    template_df = pd.DataFrame([example_row], columns=TEMPLATE_COLUMNS)
+
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        template_df.to_excel(writer, index=False, sheet_name="點位資料")
+        options_df = pd.DataFrame({
+            "擺放位置可填值": pd.Series(LOCATION_OPTIONS),
+            "盆栽擺放型態可填值": pd.Series(ARRANGEMENT_OPTIONS),
+        })
+        options_df.to_excel(writer, index=False, sheet_name="欄位選項說明")
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def parse_template_excel(file_bytes):
+    """
+    解析使用者上傳的 Excel 範本，回傳 (records: list[dict], error: str or None)。
+    每筆 record 只含 TEMPLATE_COLUMNS 欄位（缺的欄位補空/補 0）。
+    """
+    try:
+        try:
+            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="點位資料")
+        except Exception:
+            df = pd.read_excel(io.BytesIO(file_bytes))  # 找不到指定分頁名稱時，退回讀第一個分頁
+
+        if "點位編號" not in df.columns:
+            return [], "找不到「點位編號」欄位，請確認是用本程式提供的範本檔案。"
+
+        for col in TEMPLATE_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+
+        numeric_template_cols = [
+            "拍照距離(m)", "落地擺放高度(cm)", "吊掛擺放高度(cm)", "向上擺放高度(cm)",
+            "盆栽占用深度(cm)", "落地擺放數量", "吊掛擺放數量", "向上擺放數量",
+            "空盆栽數量", "ArUco邊長(cm)",
+        ]
+        for col in numeric_template_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        df = df.dropna(subset=["點位編號"])
+        df = df[df["點位編號"].astype(str).str.strip() != ""]
+
+        records = df[TEMPLATE_COLUMNS].to_dict(orient="records")
+        return records, None
+    except Exception as e:
+        return [], f"讀取 Excel 檔案失敗：{e}"
+
+
 # ----------------------------------------------------------------------------
 # 從目前的 mask 與比例尺，重新計算完整分析結果（初次分析與筆刷編輯後皆呼叫此函式）
 # ----------------------------------------------------------------------------
@@ -634,9 +723,9 @@ def _render_mask_editor_body():
         return
 
     st.info(
-        "🖌️ 這裡顯示的是程式判斷出來的「遮罩」本身（白色＝目前判定為植栽，黑色＝背景）。"
-        "用滑鼠塗抹：**綠色筆刷＝新增到綠化面積**、**紅色筆刷＝從綠化面積移除**。"
-        "塗抹完按「🔄 重新計算」套用並預覽，滿意後按「✅ 完成編輯」才會固定最終結果並可以儲存。"
+        "🖌️ 背景顯示的是目前照片＋遮罩的疊圖，塗抹後會**立即套用並更新畫面**，不需要另外按重新計算。"
+        "**綠色筆刷＝新增到綠化面積**、**紅色筆刷＝從綠化面積移除**。"
+        "確認沒問題後按「✅ 完成編輯」關閉視窗並更新最終結果。"
     )
     ctrl_col1, ctrl_col2 = st.columns(2)
     with ctrl_col1:
@@ -644,49 +733,51 @@ def _render_mask_editor_body():
     with ctrl_col2:
         brush_size = st.slider("筆刷大小", 5, 80, 25)
 
-    # 筆刷透明度固定 50%，塗抹時仍能同時看到底下的遮罩
+    # 筆刷透明度固定 50%，塗抹時仍能同時看到底下的照片與遮罩
     stroke_color = "rgba(0, 255, 0, 0.5)" if brush_mode.startswith("新增") else "rgba(255, 0, 0, 0.5)"
 
-    mask_display = mask_to_bgr_image(st.session_state.current_mask)
-    preview_mask_img = resize_for_canvas(mask_display, max_width=CANVAS_MAX_WIDTH)
-    ref_photo_small = resize_for_canvas(st.session_state.current_image_bgr, max_width=REFERENCE_THUMB_MAX_WIDTH)
+    # 背景＝目前照片＋目前遮罩的疊圖（不是純黑白），編輯結果會直接反映在這張圖上
+    overlay = st.session_state.current_image_bgr.copy()
+    overlay[st.session_state.current_mask > 0] = (0, 255, 0)
+    blend = cv2.addWeighted(st.session_state.current_image_bgr, 0.5, overlay, 0.5, 0)
+    preview_blend = resize_for_canvas(blend, max_width=CANVAS_MAX_WIDTH)
 
-    canvas_col, ref_col = st.columns([3, 1])
-    with canvas_col:
-        st.caption("在這裡直接對遮罩塗抹")
-        canvas_bg = Image.fromarray(bgr_to_rgb_for_display(preview_mask_img))
-        canvas_result = st_canvas(
-            fill_color="rgba(0,0,0,0)",
-            stroke_width=brush_size,
-            stroke_color=stroke_color,
-            background_image=canvas_bg,
-            update_streamlit=True,
-            height=preview_mask_img.shape[0],
-            width=preview_mask_img.shape[1],
-            drawing_mode="freedraw",
-            key=f"mask_editor_canvas_{st.session_state.canvas_key_counter}",
-        )
-    with ref_col:
-        st.caption("原始照片（參考）")
-        st.image(bgr_to_rgb_for_display(ref_photo_small), use_container_width=True)
+    st.caption("在下方畫布上直接塗抹（背景＝照片＋目前遮罩）")
+    canvas_bg = Image.fromarray(bgr_to_rgb_for_display(preview_blend))
+    canvas_result = st_canvas(
+        fill_color="rgba(0,0,0,0)",
+        stroke_width=brush_size,
+        stroke_color=stroke_color,
+        background_image=canvas_bg,
+        update_streamlit=True,
+        height=preview_blend.shape[0],
+        width=preview_blend.shape[1],
+        drawing_mode="freedraw",
+        key=f"mask_editor_canvas_{st.session_state.canvas_key_counter}",
+    )
 
-    recalc_col, finish_col, cancel_col = st.columns(3)
-    with recalc_col:
-        if st.button("🔄 重新計算", use_container_width=True):
-            image_data = get_canvas_image_data(canvas_result)
-            if image_data is not None:
-                st.session_state.current_mask = apply_canvas_strokes_to_mask(
-                    st.session_state.current_mask, image_data
-                )
-                st.session_state.canvas_key_counter += 1  # 清空畫布，避免重複套用同一筆筆刷
+    # ---- 只要畫布回傳「新的」筆刷內容（用內容雜湊值判斷，避免每次 rerun 重複套用同一筆），
+    #      就立即套用到遮罩上並重新整理畫面，不必等使用者另外按按鈕 ----
+    image_data = get_canvas_image_data(canvas_result)
+    if image_data is not None:
+        data_hash = hashlib.md5(image_data.tobytes()).hexdigest()
+        if data_hash != st.session_state.last_canvas_data_hash:
+            st.session_state.current_mask = apply_canvas_strokes_to_mask(
+                st.session_state.current_mask, image_data
+            )
+            st.session_state.last_canvas_data_hash = data_hash
+            st.session_state.canvas_key_counter += 1  # 清空畫布，避免下一輪重複套用同一筆筆刷
+            st.rerun()
+
+    revert_col, finish_col, cancel_col = st.columns(3)
+    with revert_col:
+        if st.button("↩️ 復原本次所有編輯", use_container_width=True):
+            st.session_state.current_mask = st.session_state.mask_before_editing.copy()
+            st.session_state.last_canvas_data_hash = None
+            st.session_state.canvas_key_counter += 1
             st.rerun()
     with finish_col:
         if st.button("✅ 完成編輯", type="primary", use_container_width=True):
-            image_data = get_canvas_image_data(canvas_result)
-            if image_data is not None:
-                st.session_state.current_mask = apply_canvas_strokes_to_mask(
-                    st.session_state.current_mask, image_data
-                )
             final_computed = recompute_full_result(
                 st.session_state.current_mask,
                 st.session_state.current_pixels_per_cm,
@@ -701,11 +792,14 @@ def _render_mask_editor_body():
             st.session_state.last_result = lr
             st.session_state.editing_mode = False
             st.session_state.canvas_key_counter += 1
+            st.session_state.last_canvas_data_hash = None
             st.rerun()
     with cancel_col:
-        if st.button("❌ 關閉（不套用尚未計算的筆刷）", use_container_width=True):
+        if st.button("❌ 放棄本次編輯並關閉", use_container_width=True):
+            st.session_state.current_mask = st.session_state.mask_before_editing.copy()
             st.session_state.editing_mode = False
             st.session_state.canvas_key_counter += 1
+            st.session_state.last_canvas_data_hash = None
             st.rerun()
 
 
@@ -953,6 +1047,8 @@ def main():
         with edit_col1:
             if not st.session_state.editing_mode:
                 if st.button("✏️ 編輯遮罩", use_container_width=True):
+                    st.session_state.mask_before_editing = st.session_state.current_mask.copy()
+                    st.session_state.last_canvas_data_hash = None
                     st.session_state.editing_mode = True
                     st.rerun()
             else:
@@ -985,6 +1081,182 @@ def main():
                     st.rerun()
             with save_col2:
                 st.caption("點擊左側按鈕，將目前顯示的分析結果與照片寫入下方多點位資料庫，並自動存成本機檔案。")
+
+    # ==========================================================
+    # 批次匯入點位屬性（Excel）＋ 逐筆上傳照片並執行分析
+    # ==========================================================
+    st.divider()
+    st.header("📥 批次匯入點位屬性（Excel）")
+    st.caption(
+        "可以先在 Excel 範本裡一次填好幾十筆點位的基本資料，匯入後**不會馬上分析**；"
+        "之後針對每一筆資料上傳對應照片，再按「執行分析」逐筆處理、逐筆確認結果後再儲存。"
+    )
+
+    tmpl_col1, tmpl_col2 = st.columns(2)
+    with tmpl_col1:
+        st.download_button(
+            "⬇️ 下載 Excel 範本",
+            data=build_template_excel_bytes(),
+            file_name="街道非正式綠化_點位資料範本.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with tmpl_col2:
+        uploaded_template = st.file_uploader("上傳填好的 Excel 檔案", type=["xlsx"], key="template_uploader")
+        if uploaded_template is not None:
+            if st.button("📥 加入待分析清單", use_container_width=True):
+                new_records, tmpl_error = parse_template_excel(uploaded_template.getvalue())
+                if tmpl_error:
+                    st.error(tmpl_error)
+                else:
+                    for rec in new_records:
+                        st.session_state.pending_id_counter += 1
+                        rec["_pending_id"] = st.session_state.pending_id_counter
+                        st.session_state.pending_records.append(rec)
+                    st.success(f"已加入 {len(new_records)} 筆到待分析清單。")
+                    st.rerun()
+
+    if st.session_state.pending_records:
+        st.subheader(f"🕒 待分析清單（共 {len(st.session_state.pending_records)} 筆）")
+        pending_display_df = pd.DataFrame(
+            [{k: v for k, v in r.items() if k != "_pending_id"} for r in st.session_state.pending_records]
+        )
+        st.dataframe(pending_display_df, use_container_width=True)
+
+        pending_options = {r["_pending_id"]: r["點位編號"] for r in st.session_state.pending_records}
+        selected_pending_id = st.selectbox(
+            "選擇要處理的點位",
+            options=list(pending_options.keys()),
+            format_func=lambda pid: f"{pending_options[pid]}（清單序號 {pid}）",
+            key="pending_select",
+        )
+        selected_record = next(r for r in st.session_state.pending_records if r["_pending_id"] == selected_pending_id)
+
+        with st.expander("這筆的屬性內容", expanded=False):
+            detail_series = pd.Series({k: v for k, v in selected_record.items() if k != "_pending_id"})
+            st.table(detail_series.rename("值"))
+
+        remove_col, _ = st.columns([1, 4])
+        with remove_col:
+            if st.button("🗑️ 從清單移除這一筆", key=f"remove_pending_{selected_pending_id}"):
+                st.session_state.pending_records = [
+                    r for r in st.session_state.pending_records if r["_pending_id"] != selected_pending_id
+                ]
+                st.rerun()
+
+        pending_photo = st.file_uploader(
+            "為這筆點位上傳照片", type=["jpg", "jpeg", "png"], key=f"pending_photo_{selected_pending_id}"
+        )
+
+        if pending_photo is not None:
+            pending_pil = Image.open(pending_photo)
+            pending_bgr = pil_to_bgr(pending_pil)
+            pending_ids_found, _ = detect_aruco_ids_only(pending_bgr)
+            st.image(bgr_to_rgb_for_display(pending_bgr), caption="已上傳照片預覽", use_container_width=True)
+            if pending_ids_found:
+                st.success(f"📷 已偵測到 ArUco，ID：{'、'.join(str(i) for i in pending_ids_found)}")
+            else:
+                st.warning("📷 未偵測到 ArUco 標記")
+
+            if st.button("🚀 對這筆資料執行分析", type="primary", key=f"analyze_pending_{selected_pending_id}"):
+                marker_len = float(selected_record.get("ArUco邊長(cm)", 20) or 20)
+                _annotated_p, pixels_per_cm_p, _c, dict_used_p, _mc, marker_id_p = detect_aruco_marker(pending_bgr, marker_len)
+
+                if pixels_per_cm_p is not None:
+                    scale_source_p = f"ArUco 自動偵測（字典：{dict_used_p}，ID：{marker_id_p}）"
+                elif manual_scale_override and manual_scale_override > 0:
+                    pixels_per_cm_p = manual_scale_override
+                    scale_source_p = "手動輸入"
+                else:
+                    scale_source_p = "未提供（無法換算實際面積/高度）"
+
+                if green_method == "HSV 色彩閾值":
+                    raw_mask_p = extract_green_mask_hsv(pending_bgr, h_low, h_high, s_low, v_low)
+                else:
+                    raw_mask_p = extract_green_mask_exg(pending_bgr, exg_threshold)
+                mask_p = clean_mask(raw_mask_p, kernel_size=morph_kernel)
+
+                computed_p = recompute_full_result(mask_p, pixels_per_cm_p, height_threshold_cm)
+                match_msg_p, match_status_p = build_aruco_match_message(selected_record.get("點位編號", ""), pending_ids_found)
+
+                floor_qty_p = int(float(selected_record.get("落地擺放數量", 0) or 0))
+                hanging_qty_p = int(float(selected_record.get("吊掛擺放數量", 0) or 0))
+                upward_qty_p = int(float(selected_record.get("向上擺放數量", 0) or 0))
+                empty_qty_p = int(float(selected_record.get("空盆栽數量", 0) or 0))
+
+                st.session_state.batch_pending_id = selected_pending_id
+                st.session_state.batch_image_bgr = pending_bgr
+                st.session_state.batch_mask = mask_p
+                st.session_state.batch_pixels_per_cm = pixels_per_cm_p
+                st.session_state.batch_result = {
+                    "捷運站": selected_record.get("捷運站", ""),
+                    "點位編號": selected_record.get("點位編號", ""),
+                    "ArUco偵測ID": "、".join(str(i) for i in pending_ids_found) if pending_ids_found else "",
+                    "編號比對結果": match_status_p,
+                    "拍照距離(m)": selected_record.get("拍照距離(m)", 0),
+                    "擺放位置": selected_record.get("擺放位置", ""),
+                    "盆栽擺放型態": selected_record.get("盆栽擺放型態", ""),
+                    "落地擺放高度(cm)": selected_record.get("落地擺放高度(cm)", 0),
+                    "吊掛擺放高度(cm)": selected_record.get("吊掛擺放高度(cm)", 0),
+                    "向上擺放高度(cm)": selected_record.get("向上擺放高度(cm)", 0),
+                    "盆栽占用深度(cm)": selected_record.get("盆栽占用深度(cm)", 0),
+                    "落地擺放數量": floor_qty_p,
+                    "吊掛擺放數量": hanging_qty_p,
+                    "向上擺放數量": upward_qty_p,
+                    "空盆栽數量": empty_qty_p,
+                    "擺放數量合計(不含空盆)": floor_qty_p + hanging_qty_p + upward_qty_p,
+                    "附註": selected_record.get("附註", ""),
+                    "ArUco邊長(cm)": marker_len,
+                    "比例尺來源": scale_source_p,
+                    "像素/公分比例尺": round(pixels_per_cm_p, 4) if pixels_per_cm_p else None,
+                    "AI辨識綠化面積(m2)": round(computed_p["area_m2"], 4) if computed_p["area_m2"] is not None else None,
+                    "左區高度(cm)": computed_p["zone_heights_cm"].get("left"),
+                    "中區高度(cm)": computed_p["zone_heights_cm"].get("mid"),
+                    "右區高度(cm)": computed_p["zone_heights_cm"].get("right"),
+                    "高低型態判定": computed_p["shape_label"],
+                    "照片檔名": "",
+                    "紀錄時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                st.session_state.batch_match_msg = match_msg_p
+                st.rerun()
+
+        # 顯示「目前選定這一筆」最近一次的分析結果（跨按鈕點擊持續顯示，直到儲存或換選別筆）
+        if (
+            st.session_state.get("batch_pending_id") == selected_pending_id
+            and st.session_state.get("batch_result") is not None
+        ):
+            render_result_visuals(
+                st.session_state.batch_image_bgr,
+                st.session_state.batch_mask,
+                recompute_full_result(
+                    st.session_state.batch_mask,
+                    st.session_state.batch_pixels_per_cm,
+                    height_threshold_cm,
+                ),
+            )
+            st.caption(f"ArUco 編號比對：{st.session_state.get('batch_match_msg', '')}")
+
+            if st.button("💾 儲存這筆結果並從清單移除", type="primary", key=f"save_pending_{selected_pending_id}"):
+                ts_p = st.session_state.batch_result["紀錄時間"]
+                photo_filename_p = save_photo_file(
+                    st.session_state.batch_image_bgr, st.session_state.batch_result["點位編號"], ts_p
+                )
+                st.session_state.batch_result["照片檔名"] = photo_filename_p
+
+                new_row = pd.DataFrame([st.session_state.batch_result])
+                st.session_state.dataframe = pd.concat([st.session_state.dataframe, new_row], ignore_index=True)
+                save_local_data(st.session_state.dataframe)
+
+                st.session_state.pending_records = [
+                    r for r in st.session_state.pending_records if r["_pending_id"] != selected_pending_id
+                ]
+                st.session_state.batch_pending_id = None
+                st.session_state.batch_result = None
+                st.session_state.batch_image_bgr = None
+                st.session_state.batch_mask = None
+                st.session_state.batch_pixels_per_cm = None
+                st.success("已儲存並從待分析清單移除！")
+                st.rerun()
 
     # ==========================================================
     # 資料庫檢視 / 編輯 / 刪除 / 匯出
@@ -1127,6 +1399,23 @@ def main():
                     st.image(photo_path, caption="現場照片", use_container_width=True)
                 else:
                     st.caption("（此筆紀錄沒有可顯示的照片）")
+
+                st.markdown("**重新上傳這筆的照片**")
+                replacement_photo = st.file_uploader(
+                    "選擇新照片取代目前的照片", type=["jpg", "jpeg", "png"],
+                    key=f"replace_photo_{selected_point}",
+                )
+                if replacement_photo is not None:
+                    if st.button("🔄 更新這筆的照片", key=f"replace_photo_btn_{selected_point}"):
+                        record_index = record_rows.index[-1]
+                        new_pil = Image.open(replacement_photo)
+                        new_bgr = pil_to_bgr(new_pil)
+                        new_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        new_filename = save_photo_file(new_bgr, selected_point, new_ts)
+                        st.session_state.dataframe.at[record_index, "照片檔名"] = new_filename
+                        save_local_data(st.session_state.dataframe)
+                        st.success("照片已更新！")
+                        st.rerun()
 
         # ==========================================================
         # 統計分析區塊
