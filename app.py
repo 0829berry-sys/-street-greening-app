@@ -6,7 +6,7 @@ Streamlit + OpenCV 電腦視覺應用程式
 ==================================================================================
 
 【安裝相依套件】
-    pip install streamlit opencv-python numpy pandas pillow matplotlib openpyxl xlsxwriter streamlit-drawable-canvas
+    pip install streamlit opencv-python numpy pandas pillow matplotlib openpyxl xlsxwriter
 
 【啟動方式】
     streamlit run app.py
@@ -28,7 +28,6 @@ Streamlit + OpenCV 電腦視覺應用程式
 import io
 import os
 import zipfile
-import hashlib
 from datetime import datetime
 
 import cv2
@@ -38,12 +37,6 @@ import streamlit as st
 import matplotlib.pyplot as plt
 import matplotlib
 from PIL import Image
-
-try:
-    from streamlit_drawable_canvas import st_canvas
-    CANVAS_AVAILABLE = True
-except ImportError:
-    CANVAS_AVAILABLE = False
 
 # st.dialog（彈出視窗）是較新版本 Streamlit 才有的功能，這裡做版本相容處理
 DIALOG_DECORATOR = getattr(st, "dialog", None) or getattr(st, "experimental_dialog", None)
@@ -139,8 +132,7 @@ TEMPLATE_COLUMNS = [
     "ArUco邊長(cm)", "附註",
 ]
 
-CANVAS_MAX_WIDTH = 850  # 彈出視窗中編輯畫布的最大寬度（像素）
-REFERENCE_THUMB_MAX_WIDTH = 240  # 彈出視窗中「原始照片」參考縮圖的最大寬度
+CANVAS_MAX_WIDTH = 850  # 遮罩編輯預覽圖的最大寬度（像素）
 
 
 # ----------------------------------------------------------------------------
@@ -270,8 +262,6 @@ def init_session_state():
         st.session_state.canvas_key_counter = 0
     if "mask_before_editing" not in st.session_state:
         st.session_state.mask_before_editing = None
-    if "last_canvas_data_hash" not in st.session_state:
-        st.session_state.last_canvas_data_hash = None
     if "height_threshold_cm" not in st.session_state:
         st.session_state.height_threshold_cm = HEIGHT_LEVEL_THRESHOLD_DEFAULT
     if "pending_records" not in st.session_state:
@@ -536,11 +526,6 @@ def bgr_to_rgb_for_display(bgr_image):
     return cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
 
 
-def mask_to_bgr_image(mask):
-    """把單通道 0/255 遮罩轉成可以當畫布背景的黑白三通道圖片。"""
-    return cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-
-
 def resize_for_canvas(image_bgr, max_width=CANVAS_MAX_WIDTH):
     h, w = image_bgr.shape[:2]
     if w <= max_width:
@@ -548,48 +533,6 @@ def resize_for_canvas(image_bgr, max_width=CANVAS_MAX_WIDTH):
     scale = max_width / w
     resized = cv2.resize(image_bgr, (max_width, int(round(h * scale))), interpolation=cv2.INTER_AREA)
     return resized
-
-
-def get_canvas_image_data(canvas_result):
-    """
-    安全取出 st_canvas 回傳物件的 image_data。
-    streamlit-drawable-canvas 在元件尚未完成第一次資料回傳時，存取
-    .image_data 會直接丟出 RuntimeError（而不是回傳 None），
-    這裡統一攔截，讓呼叫端可以簡單地把它當成「還沒有筆刷資料」處理。
-    """
-    if canvas_result is None:
-        return None
-    try:
-        return canvas_result.image_data
-    except RuntimeError:
-        return None
-
-
-def apply_canvas_strokes_to_mask(mask, canvas_image_data):
-    """
-    將畫布上的筆刷筆跡（RGBA，小尺寸）套用回原始尺寸的遮罩：
-    綠色筆跡（新增）→ 該處遮罩設為 255；紅色筆跡（移除）→ 該處遮罩設為 0。
-    """
-    if canvas_image_data is None:
-        return mask
-
-    h_orig, w_orig = mask.shape[:2]
-    canvas_rgb = canvas_image_data[:, :, :3].astype(np.uint8)
-    alpha = canvas_image_data[:, :, 3]
-
-    canvas_rgb_full = cv2.resize(canvas_rgb, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
-    alpha_full = cv2.resize(alpha, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
-
-    drawn = alpha_full > 10
-    r_ch, g_ch, b_ch = canvas_rgb_full[:, :, 0], canvas_rgb_full[:, :, 1], canvas_rgb_full[:, :, 2]
-
-    is_add_stroke = drawn & (g_ch > 150) & (r_ch < 100) & (b_ch < 100)
-    is_erase_stroke = drawn & (r_ch > 150) & (g_ch < 100) & (b_ch < 100)
-
-    new_mask = mask.copy()
-    new_mask[is_add_stroke] = 255
-    new_mask[is_erase_stroke] = 0
-    return new_mask
 
 
 # ----------------------------------------------------------------------------
@@ -716,69 +659,59 @@ def render_result_visuals(image_bgr, mask, computed):
 # 筆刷編輯視窗（彈出對話框；直接對「遮罩」本身進行編輯）
 # ----------------------------------------------------------------------------
 def _render_mask_editor_body():
-    if not CANVAS_AVAILABLE:
-        st.error(
-            "尚未安裝筆刷編輯所需套件，請於終端機執行："
-            "pip install streamlit-drawable-canvas 後重新啟動程式。"
-        )
-        if st.button("關閉視窗"):
-            st.session_state.editing_mode = False
-            st.rerun()
-        return
-
     st.info(
-        "🖌️ 背景顯示的是目前照片＋遮罩的疊圖，塗抹後會**立即套用並更新畫面**，不需要另外按重新計算。"
-        "**綠色筆刷＝新增到綠化面積**、**紅色筆刷＝從綠化面積移除**。"
-        "確認沒問題後按「✅ 完成編輯」關閉視窗並更新最終結果。"
+        "🖌️ 用下面的滑桿框出一個矩形區域，選擇要「新增」還是「移除」，按「套用」即可疊加到遮罩上；"
+        "可以連續套用多個矩形來組合出想要的形狀。這個工具不依賴容易失效的瀏覽器筆刷元件，"
+        "套用後會立即反映在下方的預覽圖與最終結果上。"
     )
-    ctrl_col1, ctrl_col2 = st.columns(2)
-    with ctrl_col1:
-        brush_mode = st.radio("筆刷模式", ["新增（綠色）", "移除（紅色）"], horizontal=True)
-    with ctrl_col2:
-        brush_size = st.slider("筆刷大小", 5, 80, 25)
 
-    # 筆刷透明度固定 50%，塗抹時仍能同時看到底下的照片與遮罩
-    stroke_color = "rgba(0, 255, 0, 0.5)" if brush_mode.startswith("新增") else "rgba(255, 0, 0, 0.5)"
-
-    # 背景＝目前照片＋目前遮罩的疊圖（不是純黑白），編輯結果會直接反映在這張圖上
+    # 縮小版的照片＋目前遮罩疊圖，作為預覽與座標基準
     overlay = st.session_state.current_image_bgr.copy()
     overlay[st.session_state.current_mask > 0] = (0, 255, 0)
     blend = cv2.addWeighted(st.session_state.current_image_bgr, 0.5, overlay, 0.5, 0)
-    preview_blend = resize_for_canvas(blend, max_width=CANVAS_MAX_WIDTH)
+    preview_base = resize_for_canvas(blend, max_width=CANVAS_MAX_WIDTH)
+    disp_h, disp_w = preview_base.shape[:2]
+    orig_h, orig_w = st.session_state.current_mask.shape[:2]
+    scale_x = orig_w / disp_w
+    scale_y = orig_h / disp_h
 
-    st.caption("在下方畫布上直接塗抹（背景＝照片＋目前遮罩）")
-    canvas_bg = Image.fromarray(bgr_to_rgb_for_display(preview_blend))
-    canvas_result = st_canvas(
-        fill_color="rgba(0,0,0,0)",
-        stroke_width=brush_size,
-        stroke_color=stroke_color,
-        background_image=canvas_bg,
-        update_streamlit=True,
-        height=preview_blend.shape[0],
-        width=preview_blend.shape[1],
-        drawing_mode="freedraw",
-        key=f"mask_editor_canvas_{st.session_state.canvas_key_counter}",
+    mode = st.radio("這個矩形要做什麼", ["新增到綠化面積（綠框）", "從綠化面積移除（紅框）"], horizontal=True, key="rect_mode")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        rect_x = st.slider("左邊界 X", 0, max(disp_w - 1, 1), int(disp_w * 0.3), key="rect_x")
+        rect_w = st.slider("寬度", 1, disp_w, max(int(disp_w * 0.2), 1), key="rect_w")
+    with c2:
+        rect_y = st.slider("上邊界 Y", 0, max(disp_h - 1, 1), int(disp_h * 0.3), key="rect_y")
+        rect_h = st.slider("高度", 1, disp_h, max(int(disp_h * 0.2), 1), key="rect_h")
+
+    rect_x2 = min(rect_x + rect_w, disp_w)
+    rect_y2 = min(rect_y + rect_h, disp_h)
+    rect_color = (0, 255, 0) if mode.startswith("新增") else (0, 0, 255)
+
+    preview = preview_base.copy()
+    cv2.rectangle(preview, (rect_x, rect_y), (rect_x2, rect_y2), rect_color, 3)
+    st.image(
+        bgr_to_rgb_for_display(preview),
+        caption="目前遮罩＋這次要套用的矩形範圍（框線顏色代表新增／移除）",
+        use_container_width=True,
     )
 
-    # ---- 只要畫布回傳「新的」筆刷內容（用內容雜湊值判斷，避免每次 rerun 重複套用同一筆），
-    #      就立即套用到遮罩上並重新整理畫面，不必等使用者另外按按鈕 ----
-    image_data = get_canvas_image_data(canvas_result)
-    if image_data is not None:
-        data_hash = hashlib.md5(image_data.tobytes()).hexdigest()
-        if data_hash != st.session_state.last_canvas_data_hash:
-            st.session_state.current_mask = apply_canvas_strokes_to_mask(
-                st.session_state.current_mask, image_data
-            )
-            st.session_state.last_canvas_data_hash = data_hash
-            st.session_state.canvas_key_counter += 1  # 清空畫布，避免下一輪重複套用同一筆筆刷
+    apply_col, revert_col, finish_col, cancel_col = st.columns(4)
+    with apply_col:
+        if st.button("➕ 套用這個矩形", type="primary", use_container_width=True):
+            x0, x1 = int(rect_x * scale_x), int(rect_x2 * scale_x)
+            y0, y1 = int(rect_y * scale_y), int(rect_y2 * scale_y)
+            new_mask = st.session_state.current_mask.copy()
+            if mode.startswith("新增"):
+                new_mask[y0:y1, x0:x1] = 255
+            else:
+                new_mask[y0:y1, x0:x1] = 0
+            st.session_state.current_mask = new_mask
             st.rerun()
-
-    revert_col, finish_col, cancel_col = st.columns(3)
     with revert_col:
         if st.button("↩️ 復原本次所有編輯", use_container_width=True):
             st.session_state.current_mask = st.session_state.mask_before_editing.copy()
-            st.session_state.last_canvas_data_hash = None
-            st.session_state.canvas_key_counter += 1
             st.rerun()
     with finish_col:
         if st.button("✅ 完成編輯", type="primary", use_container_width=True):
@@ -795,15 +728,11 @@ def _render_mask_editor_body():
             lr["高低型態判定"] = final_computed["shape_label"]
             st.session_state.last_result = lr
             st.session_state.editing_mode = False
-            st.session_state.canvas_key_counter += 1
-            st.session_state.last_canvas_data_hash = None
             st.rerun()
     with cancel_col:
         if st.button("❌ 放棄本次編輯並關閉", use_container_width=True):
             st.session_state.current_mask = st.session_state.mask_before_editing.copy()
             st.session_state.editing_mode = False
-            st.session_state.canvas_key_counter += 1
-            st.session_state.last_canvas_data_hash = None
             st.rerun()
 
 
@@ -1434,7 +1363,174 @@ def main():
             render_active_result_panel()
 
     # ==========================================================
-    # 資料庫檢視 / 編輯 / 刪除 / 匯出
+    # 歷史紀錄查詢：依捷運站篩選 / 排序 / 點選查看單筆詳細內容（含照片）
+    # ==========================================================
+    df = st.session_state.dataframe
+
+    st.divider()
+    st.header("🔍 歷史紀錄查詢")
+
+    if df.empty:
+        st.info("目前尚無已儲存的點位資料。請於上方完成單筆分析或批次匯入後儲存。")
+    else:
+        df_view = df.copy()
+        df_view["紀錄日期"] = pd.to_datetime(df_view["紀錄時間"], errors="coerce").dt.date.astype(str)
+
+        station_values = sorted(
+            v for v in df_view["捷運站"].astype(str).str.strip().unique() if v and v.lower() != "nan"
+        )
+        station_options = ["全部"] + station_values
+
+        q_col1, q_col2, q_col3 = st.columns(3)
+        with q_col1:
+            selected_station = st.selectbox("篩選捷運站", station_options, key="station_filter")
+        with q_col2:
+            sort_field = st.selectbox("排序依據", ["紀錄時間", "捷運站", "點位編號"])
+        with q_col3:
+            sort_order = st.radio("排序方式", ["新到舊／Z→A", "舊到新／A→Z"], horizontal=True)
+
+        if selected_station != "全部":
+            df_view = df_view[df_view["捷運站"].astype(str).str.strip() == selected_station]
+
+        ascending = sort_order.startswith("舊到新")
+        try:
+            df_view = df_view.sort_values(by=sort_field, ascending=ascending)
+        except Exception:
+            pass
+
+        st.caption(f"目前顯示：{selected_station}，共 {len(df_view)} 筆")
+        st.dataframe(df_view.drop(columns=["紀錄日期"]), use_container_width=True)
+
+        st.subheader("📌 查看單一點位詳細內容")
+        if not df_view.empty:
+            # 用「點位編號｜捷運站｜紀錄時間」組成顯示用標籤，並對應到資料表原始的 index，
+            # 避免不同批次匯入時點位編號重複，導致選到別筆卻顯示同一張照片。
+            label_for_index = {}
+            for idx, row in df_view.iterrows():
+                base_label = f"{row.get('點位編號', '')}｜{row.get('捷運站', '')}｜{row.get('紀錄時間', '')}"
+                label = base_label
+                dup_n = 1
+                while label in label_for_index:
+                    dup_n += 1
+                    label = f"{base_label}（重複 #{dup_n}）"
+                label_for_index[label] = idx
+
+            selected_label = st.selectbox(
+                "選擇要查看的點位（點位編號｜捷運站｜紀錄時間）",
+                list(label_for_index.keys()),
+                key="history_select",
+            )
+            record_index = label_for_index[selected_label]
+            record = df_view.loc[record_index]
+            selected_point = record.get("點位編號", "")
+
+            detail_col1, detail_col2 = st.columns([1, 1])
+            with detail_col1:
+                st.markdown(f"**捷運站**：{record.get('捷運站', '')}")
+                st.markdown(f"**擺放位置**：{record.get('擺放位置', '')}")
+                st.markdown(f"**盆栽擺放型態**：{record.get('盆栽擺放型態', '')}")
+                st.markdown(f"**擺放形式判定**：{record.get('高低型態判定', '')}")
+                st.markdown(f"**AI辨識綠化面積**：{record.get('AI辨識綠化面積(m2)', '')} m²")
+                st.markdown(f"**盆栽數量合計（不含空盆）**：{record.get('擺放數量合計(不含空盆)', '')}")
+                st.markdown(f"**附註**：{record.get('附註', '')}")
+                st.markdown(f"**紀錄時間**：{record.get('紀錄時間', '')}")
+            with detail_col2:
+                photo_filename = record.get("照片檔名", "")
+                photo_path = os.path.join(PHOTOS_DIR, str(photo_filename)) if photo_filename else ""
+                if photo_filename and os.path.exists(photo_path):
+                    st.image(photo_path, caption="現場照片", use_container_width=True)
+                else:
+                    st.caption("（此筆紀錄沒有可顯示的照片）")
+
+                st.markdown("**重新上傳這筆的照片**")
+                replacement_photo = st.file_uploader(
+                    "選擇新照片取代目前的照片", type=["jpg", "jpeg", "png"],
+                    key=f"replace_photo_{record_index}",
+                )
+                if replacement_photo is not None:
+                    if st.button("🔄 更新這筆的照片", key=f"replace_photo_btn_{record_index}"):
+                        new_pil = Image.open(replacement_photo)
+                        new_bgr = pil_to_bgr(new_pil)
+                        new_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        new_filename = save_photo_file(new_bgr, selected_point, new_ts)
+                        st.session_state.dataframe.at[record_index, "照片檔名"] = new_filename
+                        save_local_data(st.session_state.dataframe)
+                        st.success("照片已更新！")
+                        st.rerun()
+
+                if photo_filename and os.path.exists(photo_path):
+                    if st.button("✏️ 載入這張照片以編輯遮罩", key=f"reload_edit_{record_index}"):
+                        loaded_bgr = cv2.imread(photo_path)
+                        if green_method == "HSV 色彩閾值":
+                            raw_mask_h = extract_green_mask_hsv(loaded_bgr, h_low, h_high, s_low, v_low)
+                        else:
+                            raw_mask_h = extract_green_mask_exg(loaded_bgr, exg_threshold)
+                        mask_h = clean_mask(raw_mask_h, kernel_size=morph_kernel)
+
+                        # 比例尺優先沿用這筆紀錄原本存的像素/公分比例尺；沒有的話才重新偵測 ArUco
+                        stored_scale = None
+                        raw_scale_val = record.get("像素/公分比例尺", None)
+                        try:
+                            if raw_scale_val not in (None, "", "None") and not pd.isna(raw_scale_val):
+                                stored_scale = float(raw_scale_val)
+                        except (TypeError, ValueError):
+                            stored_scale = None
+                        if stored_scale is None:
+                            marker_len_h = float(record.get("ArUco邊長(cm)", 20) or 20)
+                            _ann_h, stored_scale, _c, _d, _mc, _mid = detect_aruco_marker(loaded_bgr, marker_len_h)
+
+                        st.session_state.current_image_bgr = loaded_bgr
+                        st.session_state.current_mask = mask_h
+                        st.session_state.current_pixels_per_cm = stored_scale
+                        st.session_state.height_threshold_cm = height_threshold_cm
+                        st.session_state.last_result = {col: record.get(col, "") for col in DATAFRAME_COLUMNS}
+                        st.session_state.active_history_edit_index = record_index
+                        st.session_state.active_batch_pending_id = None
+                        st.session_state.editing_mode = False
+                        st.rerun()
+                    st.caption("用目前側邊欄的影像分析參數重新產生遮罩（不一定跟當初存檔時完全相同），可以在下方微調後更新這筆紀錄。")
+
+            if st.session_state.active_history_edit_index == record_index:
+                render_active_result_panel()
+
+        # ==========================================================
+        # 統計分析區塊
+        # ==========================================================
+        st.divider()
+        st.header("📈 統計分析")
+
+        st.subheader("連續變數描述性統計")
+        numeric_df = df[NUMERIC_COLS_FOR_STATS].apply(pd.to_numeric, errors="coerce")
+        if numeric_df.dropna(how="all").empty:
+            st.info("尚無足夠的數值資料可供統計。")
+        else:
+            stats_table = pd.DataFrame({
+                "平均值 (Mean)": numeric_df.mean(),
+                "中位數 (Median)": numeric_df.median(),
+                "標準差 (Std Dev)": numeric_df.std(),
+                "最大值 (Max)": numeric_df.max(),
+                "最小值 (Min)": numeric_df.min(),
+                "樣本數 (N)": numeric_df.count(),
+            }).round(3)
+            st.dataframe(stats_table, use_container_width=True)
+
+        st.subheader("類別變數次數分配")
+        cat_cols = st.columns(len(CATEGORICAL_COLS_FOR_STATS))
+        for i, col_name in enumerate(CATEGORICAL_COLS_FOR_STATS):
+            with cat_cols[i]:
+                counts = df[col_name].value_counts()
+                fig, ax = plt.subplots(figsize=(4, 3))
+                ax.bar(counts.index.astype(str), counts.values, color="#4CAF50")
+                ax.set_title(col_name, fontsize=10)
+                ax.set_ylabel("次數")
+                plt.xticks(rotation=30, ha="right", fontsize=8)
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+
+    # ==========================================================
+    # 多點位資料庫：完整備份／還原 ＋ 可直接編輯的原始資料表（移到最下方，
+    # 平常瀏覽建議用上方的「歷史紀錄查詢」，這裡保留給需要大量編輯欄位或備份/還原的情境）
     # ==========================================================
     st.divider()
     st.header("🗄️ 多點位資料庫")
@@ -1521,147 +1617,6 @@ def main():
                 use_container_width=True,
             )
 
-        # ==========================================================
-        # 歷史紀錄查詢：排序 / 分組 / 點選查看單筆詳細內容（含照片）
-        # ==========================================================
-        st.divider()
-        st.header("🔍 歷史紀錄查詢")
-
-        q_col1, q_col2, q_col3 = st.columns(3)
-        with q_col1:
-            group_by_field = st.selectbox("分組依據", ["不分組", "捷運站", "紀錄日期"])
-        with q_col2:
-            sort_field = st.selectbox("排序依據", ["紀錄時間", "捷運站", "點位編號"])
-        with q_col3:
-            sort_order = st.radio("排序方式", ["新到舊／Z→A", "舊到新／A→Z"], horizontal=True)
-
-        df_view = df.copy()
-        df_view["紀錄日期"] = pd.to_datetime(df_view["紀錄時間"], errors="coerce").dt.date.astype(str)
-        ascending = sort_order.startswith("舊到新")
-        try:
-            df_view = df_view.sort_values(by=sort_field, ascending=ascending)
-        except Exception:
-            pass
-
-        if group_by_field == "不分組":
-            st.dataframe(df_view.drop(columns=["紀錄日期"]), use_container_width=True)
-        else:
-            for group_name, group_df in df_view.groupby(group_by_field):
-                with st.expander(f"{group_by_field}：{group_name}（{len(group_df)} 筆）"):
-                    st.dataframe(group_df.drop(columns=["紀錄日期"]), use_container_width=True)
-
-        st.subheader("📌 查看單一點位詳細內容")
-        point_options = df_view["點位編號"].tolist()
-        if point_options:
-            selected_point = st.selectbox("選擇要查看的點位編號", point_options, key="history_select")
-            record_rows = df_view[df_view["點位編號"] == selected_point]
-            record = record_rows.iloc[-1]
-
-            detail_col1, detail_col2 = st.columns([1, 1])
-            with detail_col1:
-                st.markdown(f"**捷運站**：{record.get('捷運站', '')}")
-                st.markdown(f"**擺放位置**：{record.get('擺放位置', '')}")
-                st.markdown(f"**盆栽擺放型態**：{record.get('盆栽擺放型態', '')}")
-                st.markdown(f"**擺放形式判定**：{record.get('高低型態判定', '')}")
-                st.markdown(f"**AI辨識綠化面積**：{record.get('AI辨識綠化面積(m2)', '')} m²")
-                st.markdown(f"**盆栽數量合計（不含空盆）**：{record.get('擺放數量合計(不含空盆)', '')}")
-                st.markdown(f"**附註**：{record.get('附註', '')}")
-                st.markdown(f"**紀錄時間**：{record.get('紀錄時間', '')}")
-            with detail_col2:
-                photo_filename = record.get("照片檔名", "")
-                photo_path = os.path.join(PHOTOS_DIR, str(photo_filename)) if photo_filename else ""
-                if photo_filename and os.path.exists(photo_path):
-                    st.image(photo_path, caption="現場照片", use_container_width=True)
-                else:
-                    st.caption("（此筆紀錄沒有可顯示的照片）")
-
-                st.markdown("**重新上傳這筆的照片**")
-                replacement_photo = st.file_uploader(
-                    "選擇新照片取代目前的照片", type=["jpg", "jpeg", "png"],
-                    key=f"replace_photo_{selected_point}",
-                )
-                if replacement_photo is not None:
-                    if st.button("🔄 更新這筆的照片", key=f"replace_photo_btn_{selected_point}"):
-                        record_index = record_rows.index[-1]
-                        new_pil = Image.open(replacement_photo)
-                        new_bgr = pil_to_bgr(new_pil)
-                        new_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        new_filename = save_photo_file(new_bgr, selected_point, new_ts)
-                        st.session_state.dataframe.at[record_index, "照片檔名"] = new_filename
-                        save_local_data(st.session_state.dataframe)
-                        st.success("照片已更新！")
-                        st.rerun()
-
-                if photo_filename and os.path.exists(photo_path):
-                    if st.button("✏️ 載入這張照片以編輯遮罩", key=f"reload_edit_{selected_point}"):
-                        loaded_bgr = cv2.imread(photo_path)
-                        if green_method == "HSV 色彩閾值":
-                            raw_mask_h = extract_green_mask_hsv(loaded_bgr, h_low, h_high, s_low, v_low)
-                        else:
-                            raw_mask_h = extract_green_mask_exg(loaded_bgr, exg_threshold)
-                        mask_h = clean_mask(raw_mask_h, kernel_size=morph_kernel)
-
-                        # 比例尺優先沿用這筆紀錄原本存的像素/公分比例尺；沒有的話才重新偵測 ArUco
-                        stored_scale = None
-                        raw_scale_val = record.get("像素/公分比例尺", None)
-                        try:
-                            if raw_scale_val not in (None, "", "None") and not pd.isna(raw_scale_val):
-                                stored_scale = float(raw_scale_val)
-                        except (TypeError, ValueError):
-                            stored_scale = None
-                        if stored_scale is None:
-                            marker_len_h = float(record.get("ArUco邊長(cm)", 20) or 20)
-                            _ann_h, stored_scale, _c, _d, _mc, _mid = detect_aruco_marker(loaded_bgr, marker_len_h)
-
-                        st.session_state.current_image_bgr = loaded_bgr
-                        st.session_state.current_mask = mask_h
-                        st.session_state.current_pixels_per_cm = stored_scale
-                        st.session_state.height_threshold_cm = height_threshold_cm
-                        st.session_state.last_result = {col: record.get(col, "") for col in DATAFRAME_COLUMNS}
-                        st.session_state.active_history_edit_index = record_rows.index[-1]
-                        st.session_state.active_batch_pending_id = None
-                        st.session_state.editing_mode = False
-                        st.session_state.canvas_key_counter += 1
-                        st.rerun()
-                    st.caption("用目前側邊欄的影像分析參數重新產生遮罩（不一定跟當初存檔時完全相同），可以在下方用筆刷微調後更新這筆紀錄。")
-
-            if st.session_state.active_history_edit_index == record_rows.index[-1]:
-                render_active_result_panel()
-
-        # ==========================================================
-        # 統計分析區塊
-        # ==========================================================
-        st.divider()
-        st.header("📈 統計分析")
-
-        st.subheader("連續變數描述性統計")
-        numeric_df = df[NUMERIC_COLS_FOR_STATS].apply(pd.to_numeric, errors="coerce")
-        if numeric_df.dropna(how="all").empty:
-            st.info("尚無足夠的數值資料可供統計。")
-        else:
-            stats_table = pd.DataFrame({
-                "平均值 (Mean)": numeric_df.mean(),
-                "中位數 (Median)": numeric_df.median(),
-                "標準差 (Std Dev)": numeric_df.std(),
-                "最大值 (Max)": numeric_df.max(),
-                "最小值 (Min)": numeric_df.min(),
-                "樣本數 (N)": numeric_df.count(),
-            }).round(3)
-            st.dataframe(stats_table, use_container_width=True)
-
-        st.subheader("類別變數次數分配")
-        cat_cols = st.columns(len(CATEGORICAL_COLS_FOR_STATS))
-        for i, col_name in enumerate(CATEGORICAL_COLS_FOR_STATS):
-            with cat_cols[i]:
-                counts = df[col_name].value_counts()
-                fig, ax = plt.subplots(figsize=(4, 3))
-                ax.bar(counts.index.astype(str), counts.values, color="#4CAF50")
-                ax.set_title(col_name, fontsize=10)
-                ax.set_ylabel("次數")
-                plt.xticks(rotation=30, ha="right", fontsize=8)
-                plt.tight_layout()
-                st.pyplot(fig)
-                plt.close(fig)
 
 
 if __name__ == "__main__":

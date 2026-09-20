@@ -6,4 +6,3 @@ pillow
 matplotlib
 openpyxl
 xlsxwriter
-streamlit-drawable-canvas
