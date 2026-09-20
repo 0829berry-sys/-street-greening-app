@@ -28,6 +28,7 @@ Streamlit + OpenCV 電腦視覺應用程式
 import io
 import os
 import zipfile
+import uuid
 from datetime import datetime
 
 import cv2
@@ -165,11 +166,17 @@ def save_local_data(df):
 
 def save_photo_file(image_bgr, point_id, timestamp_str):
     safe_id = "".join(c for c in str(point_id) if c.isalnum() or c in ("-", "_")) or "point"
-    filename = f"{safe_id}_{timestamp_str.replace(':', '').replace(' ', '_').replace('-', '')}.jpg"
+    # 用微秒級時間戳＋隨機字串，確保檔名絕對不會撞名（避免批次處理時，
+    # 短時間內存很多張照片、或不同捷運站剛好用了相同點位編號，導致互相覆蓋）
+    unique_token = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    filename = f"{safe_id}_{unique_token}.jpg"
     filepath = os.path.join(PHOTOS_DIR, filename)
+    if os.path.exists(filepath):
+        filename = f"{safe_id}_{unique_token}_{uuid.uuid4().hex[:6]}.jpg"
+        filepath = os.path.join(PHOTOS_DIR, filename)
     try:
-        cv2.imwrite(filepath, image_bgr)
-        return filename
+        ok = imwrite_unicode(filepath, image_bgr)
+        return filename if ok else ""
     except Exception:
         return ""
 
@@ -524,6 +531,34 @@ def pil_to_bgr(pil_image):
 
 def bgr_to_rgb_for_display(bgr_image):
     return cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+
+
+def imwrite_unicode(filepath, image_bgr, ext=".jpg"):
+    """
+    Windows 上如果檔案路徑含有中文字元（例如帳號、資料夾名稱是中文），
+    cv2.imwrite / cv2.imread 常會「靜默失敗」──不會丟出例外，只是直接回傳
+    False / None，導致照片實際上沒寫入或讀不回來。這裡改用「先編碼成 bytes、
+    再用 Python 內建檔案寫入」的方式繞過這個已知限制。
+    """
+    success, encoded = cv2.imencode(ext, image_bgr)
+    if not success:
+        return False
+    with open(filepath, "wb") as f:
+        f.write(encoded.tobytes())
+    return True
+
+
+def imread_unicode(filepath):
+    """對應 imwrite_unicode 的讀取版本，同樣避開中文路徑的問題。"""
+    if not filepath or not os.path.exists(filepath):
+        return None
+    try:
+        data = np.fromfile(filepath, dtype=np.uint8)
+    except Exception:
+        return None
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 
 def resize_for_canvas(image_bgr, max_width=CANVAS_MAX_WIDTH):
@@ -1460,34 +1495,40 @@ def main():
 
                 if photo_filename and os.path.exists(photo_path):
                     if st.button("✏️ 載入這張照片以編輯遮罩", key=f"reload_edit_{record_index}"):
-                        loaded_bgr = cv2.imread(photo_path)
-                        if green_method == "HSV 色彩閾值":
-                            raw_mask_h = extract_green_mask_hsv(loaded_bgr, h_low, h_high, s_low, v_low)
+                        loaded_bgr = imread_unicode(photo_path)
+                        if loaded_bgr is None:
+                            st.error(
+                                "讀取照片失敗（可能是檔案損毀，或路徑中含有中文字元造成讀取問題）。"
+                                "可以試試看用左邊「重新上傳這筆的照片」換一張。"
+                            )
                         else:
-                            raw_mask_h = extract_green_mask_exg(loaded_bgr, exg_threshold)
-                        mask_h = clean_mask(raw_mask_h, kernel_size=morph_kernel)
+                            if green_method == "HSV 色彩閾值":
+                                raw_mask_h = extract_green_mask_hsv(loaded_bgr, h_low, h_high, s_low, v_low)
+                            else:
+                                raw_mask_h = extract_green_mask_exg(loaded_bgr, exg_threshold)
+                            mask_h = clean_mask(raw_mask_h, kernel_size=morph_kernel)
 
-                        # 比例尺優先沿用這筆紀錄原本存的像素/公分比例尺；沒有的話才重新偵測 ArUco
-                        stored_scale = None
-                        raw_scale_val = record.get("像素/公分比例尺", None)
-                        try:
-                            if raw_scale_val not in (None, "", "None") and not pd.isna(raw_scale_val):
-                                stored_scale = float(raw_scale_val)
-                        except (TypeError, ValueError):
+                            # 比例尺優先沿用這筆紀錄原本存的像素/公分比例尺；沒有的話才重新偵測 ArUco
                             stored_scale = None
-                        if stored_scale is None:
-                            marker_len_h = float(record.get("ArUco邊長(cm)", 20) or 20)
-                            _ann_h, stored_scale, _c, _d, _mc, _mid = detect_aruco_marker(loaded_bgr, marker_len_h)
+                            raw_scale_val = record.get("像素/公分比例尺", None)
+                            try:
+                                if raw_scale_val not in (None, "", "None") and not pd.isna(raw_scale_val):
+                                    stored_scale = float(raw_scale_val)
+                            except (TypeError, ValueError):
+                                stored_scale = None
+                            if stored_scale is None:
+                                marker_len_h = float(record.get("ArUco邊長(cm)", 20) or 20)
+                                _ann_h, stored_scale, _c, _d, _mc, _mid = detect_aruco_marker(loaded_bgr, marker_len_h)
 
-                        st.session_state.current_image_bgr = loaded_bgr
-                        st.session_state.current_mask = mask_h
-                        st.session_state.current_pixels_per_cm = stored_scale
-                        st.session_state.height_threshold_cm = height_threshold_cm
-                        st.session_state.last_result = {col: record.get(col, "") for col in DATAFRAME_COLUMNS}
-                        st.session_state.active_history_edit_index = record_index
-                        st.session_state.active_batch_pending_id = None
-                        st.session_state.editing_mode = False
-                        st.rerun()
+                            st.session_state.current_image_bgr = loaded_bgr
+                            st.session_state.current_mask = mask_h
+                            st.session_state.current_pixels_per_cm = stored_scale
+                            st.session_state.height_threshold_cm = height_threshold_cm
+                            st.session_state.last_result = {col: record.get(col, "") for col in DATAFRAME_COLUMNS}
+                            st.session_state.active_history_edit_index = record_index
+                            st.session_state.active_batch_pending_id = None
+                            st.session_state.editing_mode = False
+                            st.rerun()
                     st.caption("用目前側邊欄的影像分析參數重新產生遮罩（不一定跟當初存檔時完全相同），可以在下方微調後更新這筆紀錄。")
 
             if st.session_state.active_history_edit_index == record_index:
