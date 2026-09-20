@@ -139,7 +139,7 @@ TEMPLATE_COLUMNS = [
     "ArUco邊長(cm)", "附註",
 ]
 
-CANVAS_MAX_WIDTH = 1050  # 遮罩編輯預覽圖的最大寬度（像素）
+CANVAS_MAX_WIDTH = 1575  # 遮罩編輯預覽圖的最大寬度（像素）
 
 
 # ----------------------------------------------------------------------------
@@ -277,6 +277,8 @@ def init_session_state():
         st.session_state.mask_before_editing = None
     if "last_applied_box" not in st.session_state:
         st.session_state.last_applied_box = None
+    if "cropper_baseline_marker" not in st.session_state:
+        st.session_state.cropper_baseline_marker = None
     if "height_threshold_cm" not in st.session_state:
         st.session_state.height_threshold_cm = HEIGHT_LEVEL_THRESHOLD_DEFAULT
     if "pending_records" not in st.session_state:
@@ -798,6 +800,7 @@ def _render_mask_editor_drag():
         scale_y = orig_h / disp_h
 
         pil_preview = Image.fromarray(bgr_to_rgb_for_display(preview_base))
+        cropper_key = f"mask_cropper_{st.session_state.canvas_key_counter}"
 
         # realtime_update=False：只有放開滑鼠、圈選結束時才會觸發一次更新，
         # 拖曳過程中不會一直重新整理頁面。
@@ -807,7 +810,7 @@ def _render_mask_editor_drag():
             box_color=box_color_hex,
             aspect_ratio=None,
             return_type="box",
-            key=f"mask_cropper_{st.session_state.canvas_key_counter}",
+            key=cropper_key,
         )
 
         left = int(_get_box_value(box, "left", "x"))
@@ -816,9 +819,14 @@ def _render_mask_editor_drag():
         height = int(_get_box_value(box, "height", "h", default=0))
         box_signature = (left, top, width, height)
 
-        # 只要偵測到「跟上次套用過的不一樣」的框選範圍，就立即套用，
-        # 不透過另一個按鈕點擊去讀取（避免元件在下一次互動時把框選狀態重置的問題）。
-        if width > 0 and height > 0 and box_signature != st.session_state.get("last_applied_box"):
+        if st.session_state.get("cropper_baseline_marker") != cropper_key:
+            # 這個框選元件剛出現（可能是初次打開編輯視窗，或剛套用完一個矩形後重新產生的新元件），
+            # 它預設就會有一個初始框，這裡只把它當成起始狀態記錄下來、不當作使用者已經拖曳過，
+            # 避免「還沒開始操作就先套用了預設框」的問題。
+            st.session_state.cropper_baseline_marker = cropper_key
+            st.session_state.last_applied_box = box_signature
+        elif width > 0 and height > 0 and box_signature != st.session_state.get("last_applied_box"):
+            # 跟起始狀態（或上一次套用過的框）不一樣，代表使用者真的拖曳、放開了滑鼠，才套用
             x0, x1 = int(left * scale_x), int((left + width) * scale_x)
             y0, y1 = int(top * scale_y), int((top + height) * scale_y)
             new_mask = st.session_state.current_mask.copy()
@@ -940,6 +948,7 @@ def render_active_result_panel():
             if st.button("✏️ 編輯遮罩", use_container_width=True, key="edit_mask_btn"):
                 st.session_state.mask_before_editing = st.session_state.current_mask.copy()
                 st.session_state.last_applied_box = None
+                st.session_state.cropper_baseline_marker = None
                 st.session_state.editing_mode = True
                 st.rerun()
         else:
