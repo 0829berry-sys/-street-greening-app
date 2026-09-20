@@ -43,12 +43,6 @@ from PIL import Image
 DIALOG_DECORATOR = getattr(st, "dialog", None) or getattr(st, "experimental_dialog", None)
 DIALOG_SUPPORTED = DIALOG_DECORATOR is not None
 
-try:
-    from streamlit_cropper import st_cropper
-    CROPPER_AVAILABLE = True
-except ImportError:
-    CROPPER_AVAILABLE = False
-
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 # ----------------------------------------------------------------------------
@@ -275,10 +269,6 @@ def init_session_state():
         st.session_state.canvas_key_counter = 0
     if "mask_before_editing" not in st.session_state:
         st.session_state.mask_before_editing = None
-    if "last_applied_box" not in st.session_state:
-        st.session_state.last_applied_box = None
-    if "cropper_baseline_marker" not in st.session_state:
-        st.session_state.cropper_baseline_marker = None
     if "height_threshold_cm" not in st.session_state:
         st.session_state.height_threshold_cm = HEIGHT_LEVEL_THRESHOLD_DEFAULT
     if "pending_records" not in st.session_state:
@@ -710,62 +700,56 @@ def render_result_visuals(image_bgr, mask, computed):
 # ----------------------------------------------------------------------------
 # 筆刷編輯視窗（彈出對話框；直接對「遮罩」本身進行編輯）
 # ----------------------------------------------------------------------------
-def _render_finish_revert_cancel_buttons():
-    """三個編輯階段共用的收尾按鈕：復原本次編輯／完成編輯／放棄並關閉。"""
-    revert_col, finish_col, cancel_col = st.columns(3)
-    with revert_col:
-        if st.button("↩️ 復原本次所有編輯", use_container_width=True):
-            st.session_state.current_mask = st.session_state.mask_before_editing.copy()
-            st.session_state.canvas_key_counter += 1
-            st.rerun()
-    with finish_col:
-        if st.button("✅ 完成編輯", type="primary", use_container_width=True):
-            final_computed = recompute_full_result(
-                st.session_state.current_mask,
-                st.session_state.current_pixels_per_cm,
-                st.session_state.height_threshold_cm,
-            )
-            lr = st.session_state.last_result
-            lr["AI辨識綠化面積(m2)"] = round(final_computed["area_m2"], 4) if final_computed["area_m2"] is not None else None
-            lr["左區高度(cm)"] = final_computed["zone_heights_cm"].get("left")
-            lr["中區高度(cm)"] = final_computed["zone_heights_cm"].get("mid")
-            lr["右區高度(cm)"] = final_computed["zone_heights_cm"].get("right")
-            lr["高低型態判定"] = final_computed["shape_label"]
-            st.session_state.last_result = lr
-            st.session_state.editing_mode = False
-            st.rerun()
-    with cancel_col:
-        if st.button("❌ 放棄本次編輯並關閉", use_container_width=True):
-            st.session_state.current_mask = st.session_state.mask_before_editing.copy()
-            st.session_state.editing_mode = False
-            st.rerun()
-
-
-def _get_box_value(box, *keys, default=0):
-    """streamlit-cropper 不同版本回傳的 box 欄位命名略有差異，這裡都嘗試看看。"""
-    for k in keys:
-        if isinstance(box, dict) and k in box:
-            return box[k]
-    return default
-
-
-def _render_mask_editor_drag():
-    """按住滑鼠左鍵拖曳圈選矩形（主要方式，需要 streamlit-cropper 套件）。"""
+def _render_mask_editor_body():
+    """
+    遮罩編輯工具：只用 Streamlit 內建的「範圍滑桿」（拖動滑桿兩端決定範圍），
+    不使用任何需要瀏覽器端額外元件的第三方套件，避免之前反覆出現的同步問題。
+    """
     st.info(
-        "🖱️ 先在右側選擇「新增」或「移除」，再到左邊照片上**按住滑鼠左鍵拖曳**圈出範圍，"
-        "**放開滑鼠就會立即套用**（不用再另外按套用按鈕）。可以重複拖曳多次來組合出想要的形狀。"
+        "用下面兩條滑桿分別拖出「水平範圍」與「垂直範圍」，框出一個矩形；"
+        "選擇要「新增」還是「移除」，按「➕ 套用這個矩形」套用到遮罩上，"
+        "可以連續套用多個矩形來組合出想要的形狀。"
     )
+
+    overlay = st.session_state.current_image_bgr.copy()
+    overlay[st.session_state.current_mask > 0] = (0, 255, 0)
+    blend = cv2.addWeighted(st.session_state.current_image_bgr, 0.5, overlay, 0.5, 0)
+    preview_base = resize_for_canvas(blend, max_width=CANVAS_MAX_WIDTH)
+    disp_h, disp_w = preview_base.shape[:2]
+    orig_h, orig_w = st.session_state.current_mask.shape[:2]
+    scale_x = orig_w / disp_w
+    scale_y = orig_h / disp_h
 
     img_col, ctrl_col = st.columns([3, 1])
 
     with ctrl_col:
         mode = st.radio("這次要", ["新增（綠框）", "移除（紅框）"], key="rect_mode")
-        st.caption("放開滑鼠＝立即套用到遮罩")
+
+        st.caption("水平範圍（左－右）")
+        x_range = st.slider(
+            "水平範圍", 0, disp_w, (int(disp_w * 0.3), int(disp_w * 0.6)),
+            key="rect_x_range", label_visibility="collapsed",
+        )
+        st.caption("垂直範圍（上－下）")
+        y_range = st.slider(
+            "垂直範圍", 0, disp_h, (int(disp_h * 0.3), int(disp_h * 0.6)),
+            key="rect_y_range", label_visibility="collapsed",
+        )
+
+        if st.button("➕ 套用這個矩形", type="primary", use_container_width=True):
+            x0, x1 = int(x_range[0] * scale_x), int(x_range[1] * scale_x)
+            y0, y1 = int(y_range[0] * scale_y), int(y_range[1] * scale_y)
+            new_mask = st.session_state.current_mask.copy()
+            if mode.startswith("新增"):
+                new_mask[y0:y1, x0:x1] = 255
+            else:
+                new_mask[y0:y1, x0:x1] = 0
+            st.session_state.current_mask = new_mask
+            st.rerun()
+
         st.divider()
         if st.button("↩️ 復原全部編輯", use_container_width=True):
             st.session_state.current_mask = st.session_state.mask_before_editing.copy()
-            st.session_state.canvas_key_counter += 1
-            st.session_state.last_applied_box = None
             st.rerun()
         if st.button("✅ 完成編輯", type="primary", use_container_width=True):
             final_computed = recompute_full_result(
@@ -788,120 +772,14 @@ def _render_mask_editor_drag():
             st.rerun()
 
     with img_col:
-        box_color_hex = "#00FF00" if mode.startswith("新增") else "#FF0000"
-
-        overlay = st.session_state.current_image_bgr.copy()
-        overlay[st.session_state.current_mask > 0] = (0, 255, 0)
-        blend = cv2.addWeighted(st.session_state.current_image_bgr, 0.5, overlay, 0.5, 0)
-        preview_base = resize_for_canvas(blend, max_width=CANVAS_MAX_WIDTH)
-        disp_h, disp_w = preview_base.shape[:2]
-        orig_h, orig_w = st.session_state.current_mask.shape[:2]
-        scale_x = orig_w / disp_w
-        scale_y = orig_h / disp_h
-
-        pil_preview = Image.fromarray(bgr_to_rgb_for_display(preview_base))
-        cropper_key = f"mask_cropper_{st.session_state.canvas_key_counter}"
-
-        # realtime_update=False：只有放開滑鼠、圈選結束時才會觸發一次更新，
-        # 拖曳過程中不會一直重新整理頁面。
-        box = st_cropper(
-            pil_preview,
-            realtime_update=False,
-            box_color=box_color_hex,
-            aspect_ratio=None,
-            return_type="box",
-            key=cropper_key,
+        rect_color = (0, 255, 0) if mode.startswith("新增") else (0, 0, 255)
+        preview = preview_base.copy()
+        cv2.rectangle(preview, (x_range[0], y_range[0]), (x_range[1], y_range[1]), rect_color, 3)
+        st.image(
+            bgr_to_rgb_for_display(preview),
+            caption="目前遮罩＋這次要套用的矩形範圍（框線顏色代表新增／移除）",
+            use_container_width=True,
         )
-
-        left = int(_get_box_value(box, "left", "x"))
-        top = int(_get_box_value(box, "top", "y"))
-        width = int(_get_box_value(box, "width", "w", default=0))
-        height = int(_get_box_value(box, "height", "h", default=0))
-        box_signature = (left, top, width, height)
-
-        if st.session_state.get("cropper_baseline_marker") != cropper_key:
-            # 這個框選元件剛出現（可能是初次打開編輯視窗，或剛套用完一個矩形後重新產生的新元件），
-            # 它預設就會有一個初始框，這裡只把它當成起始狀態記錄下來、不當作使用者已經拖曳過，
-            # 避免「還沒開始操作就先套用了預設框」的問題。
-            st.session_state.cropper_baseline_marker = cropper_key
-            st.session_state.last_applied_box = box_signature
-        elif width > 0 and height > 0 and box_signature != st.session_state.get("last_applied_box"):
-            # 跟起始狀態（或上一次套用過的框）不一樣，代表使用者真的拖曳、放開了滑鼠，才套用
-            x0, x1 = int(left * scale_x), int((left + width) * scale_x)
-            y0, y1 = int(top * scale_y), int((top + height) * scale_y)
-            new_mask = st.session_state.current_mask.copy()
-            if mode.startswith("新增"):
-                new_mask[y0:y1, x0:x1] = 255
-            else:
-                new_mask[y0:y1, x0:x1] = 0
-            st.session_state.current_mask = new_mask
-            st.session_state.last_applied_box = box_signature
-            st.session_state.canvas_key_counter += 1
-            st.rerun()
-
-
-def _render_mask_editor_sliders():
-    """滑桿框選矩形（備用方式：拖曳圈選套件不可用時自動改用這個）。"""
-    st.info(
-        "🖌️ 用下面的滑桿框出一個矩形區域，選擇要「新增」還是「移除」，按「套用」即可疊加到遮罩上；"
-        "可以連續套用多個矩形來組合出想要的形狀。"
-    )
-
-    overlay = st.session_state.current_image_bgr.copy()
-    overlay[st.session_state.current_mask > 0] = (0, 255, 0)
-    blend = cv2.addWeighted(st.session_state.current_image_bgr, 0.5, overlay, 0.5, 0)
-    preview_base = resize_for_canvas(blend, max_width=CANVAS_MAX_WIDTH)
-    disp_h, disp_w = preview_base.shape[:2]
-    orig_h, orig_w = st.session_state.current_mask.shape[:2]
-    scale_x = orig_w / disp_w
-    scale_y = orig_h / disp_h
-
-    mode = st.radio("這個矩形要做什麼", ["新增到綠化面積（綠框）", "從綠化面積移除（紅框）"], horizontal=True, key="rect_mode")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        rect_x = st.slider("左邊界 X", 0, max(disp_w - 1, 1), int(disp_w * 0.3), key="rect_x")
-        rect_w = st.slider("寬度", 1, disp_w, max(int(disp_w * 0.2), 1), key="rect_w")
-    with c2:
-        rect_y = st.slider("上邊界 Y", 0, max(disp_h - 1, 1), int(disp_h * 0.3), key="rect_y")
-        rect_h = st.slider("高度", 1, disp_h, max(int(disp_h * 0.2), 1), key="rect_h")
-
-    rect_x2 = min(rect_x + rect_w, disp_w)
-    rect_y2 = min(rect_y + rect_h, disp_h)
-    rect_color = (0, 255, 0) if mode.startswith("新增") else (0, 0, 255)
-
-    preview = preview_base.copy()
-    cv2.rectangle(preview, (rect_x, rect_y), (rect_x2, rect_y2), rect_color, 3)
-    st.image(
-        bgr_to_rgb_for_display(preview),
-        caption="目前遮罩＋這次要套用的矩形範圍（框線顏色代表新增／移除）",
-        use_container_width=True,
-    )
-
-    if st.button("➕ 套用這個矩形", type="primary", use_container_width=True):
-        x0, x1 = int(rect_x * scale_x), int(rect_x2 * scale_x)
-        y0, y1 = int(rect_y * scale_y), int(rect_y2 * scale_y)
-        new_mask = st.session_state.current_mask.copy()
-        if mode.startswith("新增"):
-            new_mask[y0:y1, x0:x1] = 255
-        else:
-            new_mask[y0:y1, x0:x1] = 0
-        st.session_state.current_mask = new_mask
-        st.rerun()
-
-    st.divider()
-    _render_finish_revert_cancel_buttons()
-
-
-def _render_mask_editor_body():
-    if CROPPER_AVAILABLE:
-        _render_mask_editor_drag()
-    else:
-        st.warning(
-            "尚未安裝拖曳圈選所需套件，暫時使用滑桿版本。"
-            "如果想改用滑鼠拖曳，請於終端機執行：pip install streamlit-cropper 後重新啟動程式。"
-        )
-        _render_mask_editor_sliders()
 
 
 if DIALOG_SUPPORTED:
@@ -947,8 +825,6 @@ def render_active_result_panel():
         if not st.session_state.editing_mode:
             if st.button("✏️ 編輯遮罩", use_container_width=True, key="edit_mask_btn"):
                 st.session_state.mask_before_editing = st.session_state.current_mask.copy()
-                st.session_state.last_applied_box = None
-                st.session_state.cropper_baseline_marker = None
                 st.session_state.editing_mode = True
                 st.rerun()
         else:
