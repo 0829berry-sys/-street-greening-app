@@ -44,10 +44,10 @@ DIALOG_DECORATOR = getattr(st, "dialog", None) or getattr(st, "experimental_dial
 DIALOG_SUPPORTED = DIALOG_DECORATOR is not None
 
 try:
-    from streamlit_image_coordinates import streamlit_image_coordinates
-    IMAGE_COORDS_AVAILABLE = True
+    from streamlit_cropper import st_cropper
+    CROPPER_AVAILABLE = True
 except ImportError:
-    IMAGE_COORDS_AVAILABLE = False
+    CROPPER_AVAILABLE = False
 
 matplotlib.rcParams["axes.unicode_minus"] = False
 
@@ -275,18 +275,20 @@ def init_session_state():
         st.session_state.canvas_key_counter = 0
     if "mask_before_editing" not in st.session_state:
         st.session_state.mask_before_editing = None
-    if "rect_first_corner" not in st.session_state:
-        st.session_state.rect_first_corner = None
-    if "rect_second_corner" not in st.session_state:
-        st.session_state.rect_second_corner = None
-    if "last_click_coords" not in st.session_state:
-        st.session_state.last_click_coords = None
     if "height_threshold_cm" not in st.session_state:
         st.session_state.height_threshold_cm = HEIGHT_LEVEL_THRESHOLD_DEFAULT
     if "pending_records" not in st.session_state:
         st.session_state.pending_records = []
     if "pending_id_counter" not in st.session_state:
         st.session_state.pending_id_counter = 0
+    if "cached_backup_zip" not in st.session_state:
+        st.session_state.cached_backup_zip = None
+    if "cached_backup_zip_ts" not in st.session_state:
+        st.session_state.cached_backup_zip_ts = ""
+    if "cached_excel_bytes" not in st.session_state:
+        st.session_state.cached_excel_bytes = None
+    if "cached_excel_ts" not in st.session_state:
+        st.session_state.cached_excel_ts = ""
     if "active_batch_pending_id" not in st.session_state:
         st.session_state.active_batch_pending_id = None
     if "active_history_edit_index" not in st.session_state:
@@ -428,7 +430,8 @@ def compute_green_area_m2(mask, pixels_per_cm):
 # ----------------------------------------------------------------------------
 def analyze_zone_profile(mask, pixels_per_cm):
     h, w = mask.shape[:2]
-    col_has_green = np.any(mask > 0, axis=0)
+    is_green = mask > 0
+    col_has_green = np.any(is_green, axis=0)
     valid_x = np.where(col_has_green)[0]
 
     if len(valid_x) == 0:
@@ -439,18 +442,16 @@ def analyze_zone_profile(mask, pixels_per_cm):
     x_split1 = x_min + span // 3
     x_split2 = x_min + 2 * span // 3
 
-    envelope_points = []
-    for x in valid_x:
-        col = mask[:, x]
-        ys = np.where(col > 0)[0]
-        y_top = int(ys.min())
-        envelope_points.append((int(x), y_top))
+    # 向量化找出每一欄最頂端（第一個非零 row）的 y 值，一次算完整張圖，
+    # 取代逐欄呼叫 np.where 的迴圈（那個寫法在寬幅照片上會明顯拖慢速度）。
+    top_y_per_col = np.argmax(is_green, axis=0)  # 對「沒有綠色」的欄位這裡會回傳 0，下面只會用到 valid_x 範圍內的欄位
+    envelope_points = [(int(x), int(top_y_per_col[x])) for x in valid_x]
 
     def zone_avg_height_cm(x_lo, x_hi):
-        ys_in_zone = [y for (x, y) in envelope_points if x_lo <= x <= x_hi]
-        if len(ys_in_zone) == 0:
+        cols_in_zone = valid_x[(valid_x >= x_lo) & (valid_x <= x_hi)]
+        if len(cols_in_zone) == 0:
             return None
-        avg_y_top = float(np.mean(ys_in_zone))
+        avg_y_top = float(np.mean(top_y_per_col[cols_in_zone]))
         height_px = h - avg_y_top
         if pixels_per_cm is None or pixels_per_cm <= 0:
             return None
@@ -711,8 +712,7 @@ def _render_finish_revert_cancel_buttons():
     with revert_col:
         if st.button("↩️ 復原本次所有編輯", use_container_width=True):
             st.session_state.current_mask = st.session_state.mask_before_editing.copy()
-            st.session_state.rect_first_corner = None
-            st.session_state.rect_second_corner = None
+            st.session_state.canvas_key_counter += 1
             st.rerun()
     with finish_col:
         if st.button("✅ 完成編輯", type="primary", use_container_width=True):
@@ -729,27 +729,32 @@ def _render_finish_revert_cancel_buttons():
             lr["高低型態判定"] = final_computed["shape_label"]
             st.session_state.last_result = lr
             st.session_state.editing_mode = False
-            st.session_state.rect_first_corner = None
-            st.session_state.rect_second_corner = None
             st.rerun()
     with cancel_col:
         if st.button("❌ 放棄本次編輯並關閉", use_container_width=True):
             st.session_state.current_mask = st.session_state.mask_before_editing.copy()
             st.session_state.editing_mode = False
-            st.session_state.rect_first_corner = None
-            st.session_state.rect_second_corner = None
             st.rerun()
 
 
-def _render_mask_editor_click():
-    """滑鼠點兩下框選矩形（主要方式，需要 streamlit-image-coordinates 套件）。"""
+def _get_box_value(box, *keys, default=0):
+    """streamlit-cropper 不同版本回傳的 box 欄位命名略有差異，這裡都嘗試看看。"""
+    for k in keys:
+        if isinstance(box, dict) and k in box:
+            return box[k]
+    return default
+
+
+def _render_mask_editor_drag():
+    """按住滑鼠左鍵拖曳圈選矩形（主要方式，需要 streamlit-cropper 套件）。"""
     st.info(
-        "🖱️ 在下方照片上**點一下**設定矩形的一個角，**再點一下**設定對角，就會框出矩形。"
+        "🖱️ 直接在下方照片上**按住滑鼠左鍵拖曳**，圈出一個矩形範圍，放開滑鼠後範圍就會固定。"
         "選擇要「新增」還是「移除」，按「➕ 套用這個矩形」即可疊加到遮罩上；"
-        "可以連續點選、套用多個矩形來組合出想要的形狀。"
+        "可以連續圈選、套用多個矩形來組合出想要的形狀。"
     )
 
     mode = st.radio("這個矩形要做什麼", ["新增到綠化面積（綠框）", "從綠化面積移除（紅框）"], horizontal=True, key="rect_mode")
+    box_color_hex = "#00FF00" if mode.startswith("新增") else "#FF0000"
 
     overlay = st.session_state.current_image_bgr.copy()
     overlay[st.session_state.current_mask > 0] = (0, 255, 0)
@@ -760,65 +765,44 @@ def _render_mask_editor_click():
     scale_x = orig_w / disp_w
     scale_y = orig_h / disp_h
 
-    rect_color = (0, 255, 0) if mode.startswith("新增") else (0, 0, 255)
-    first_corner = st.session_state.get("rect_first_corner")
-    second_corner = st.session_state.get("rect_second_corner")
+    pil_preview = Image.fromarray(bgr_to_rgb_for_display(preview_base))
 
-    preview = preview_base.copy()
-    if first_corner is not None:
-        cv2.drawMarker(preview, first_corner, (255, 255, 0), markerType=cv2.MARKER_CROSS, markerSize=24, thickness=3)
-    if first_corner is not None and second_corner is not None:
-        rx0, rx1 = sorted([first_corner[0], second_corner[0]])
-        ry0, ry1 = sorted([first_corner[1], second_corner[1]])
-        cv2.rectangle(preview, (rx0, ry0), (rx1, ry1), rect_color, 3)
+    # realtime_update=False：只有放開滑鼠、圈選結束時才會觸發一次更新，
+    # 拖曳過程中不會一直重新整理頁面。
+    box = st_cropper(
+        pil_preview,
+        realtime_update=False,
+        box_color=box_color_hex,
+        aspect_ratio=None,
+        return_type="box",
+        key=f"mask_cropper_{st.session_state.canvas_key_counter}",
+    )
 
-    pil_preview = Image.fromarray(bgr_to_rgb_for_display(preview))
-    coords = streamlit_image_coordinates(pil_preview, key=f"mask_click_{st.session_state.canvas_key_counter}")
+    left = int(_get_box_value(box, "left", "x"))
+    top = int(_get_box_value(box, "top", "y"))
+    width = int(_get_box_value(box, "width", "w", default=0))
+    height = int(_get_box_value(box, "height", "h", default=0))
 
-    if coords is not None:
-        current_click = (int(coords["x"]), int(coords["y"]))
-        if current_click != st.session_state.get("last_click_coords"):
-            st.session_state.last_click_coords = current_click
-            if first_corner is None or second_corner is not None:
-                # 還沒開始選，或上一個矩形已經選滿了 → 開始一個新的矩形
-                st.session_state.rect_first_corner = current_click
-                st.session_state.rect_second_corner = None
+    apply_col, _ = st.columns(2)
+    with apply_col:
+        if st.button("➕ 套用這個矩形", type="primary", use_container_width=True, disabled=(width <= 0 or height <= 0)):
+            x0, x1 = int(left * scale_x), int((left + width) * scale_x)
+            y0, y1 = int(top * scale_y), int((top + height) * scale_y)
+            new_mask = st.session_state.current_mask.copy()
+            if mode.startswith("新增"):
+                new_mask[y0:y1, x0:x1] = 255
             else:
-                st.session_state.rect_second_corner = current_click
+                new_mask[y0:y1, x0:x1] = 0
+            st.session_state.current_mask = new_mask
+            st.session_state.canvas_key_counter += 1
             st.rerun()
-
-    if first_corner is not None and second_corner is not None:
-        rx0, rx1 = sorted([first_corner[0], second_corner[0]])
-        ry0, ry1 = sorted([first_corner[1], second_corner[1]])
-        apply_col, reset_col = st.columns(2)
-        with apply_col:
-            if st.button("➕ 套用這個矩形", type="primary", use_container_width=True):
-                x0, x1 = int(rx0 * scale_x), int(rx1 * scale_x)
-                y0, y1 = int(ry0 * scale_y), int(ry1 * scale_y)
-                new_mask = st.session_state.current_mask.copy()
-                if mode.startswith("新增"):
-                    new_mask[y0:y1, x0:x1] = 255
-                else:
-                    new_mask[y0:y1, x0:x1] = 0
-                st.session_state.current_mask = new_mask
-                st.session_state.rect_first_corner = None
-                st.session_state.rect_second_corner = None
-                st.session_state.canvas_key_counter += 1
-                st.rerun()
-        with reset_col:
-            if st.button("🔄 重新選取矩形", use_container_width=True):
-                st.session_state.rect_first_corner = None
-                st.session_state.rect_second_corner = None
-                st.rerun()
-    elif first_corner is not None:
-        st.caption("已設定第一個角，請在照片上點第二下設定對角。")
 
     st.divider()
     _render_finish_revert_cancel_buttons()
 
 
 def _render_mask_editor_sliders():
-    """滑桿框選矩形（備用方式：滑鼠點選套件不可用時自動改用這個）。"""
+    """滑桿框選矩形（備用方式：拖曳圈選套件不可用時自動改用這個）。"""
     st.info(
         "🖌️ 用下面的滑桿框出一個矩形區域，選擇要「新增」還是「移除」，按「套用」即可疊加到遮罩上；"
         "可以連續套用多個矩形來組合出想要的形狀。"
@@ -871,12 +855,12 @@ def _render_mask_editor_sliders():
 
 
 def _render_mask_editor_body():
-    if IMAGE_COORDS_AVAILABLE:
-        _render_mask_editor_click()
+    if CROPPER_AVAILABLE:
+        _render_mask_editor_drag()
     else:
         st.warning(
-            "尚未安裝滑鼠圈選所需套件，暫時使用滑桿版本。"
-            "如果想改用滑鼠點選，請於終端機執行：pip install streamlit-image-coordinates 後重新啟動程式。"
+            "尚未安裝拖曳圈選所需套件，暫時使用滑桿版本。"
+            "如果想改用滑鼠拖曳，請於終端機執行：pip install streamlit-cropper 後重新啟動程式。"
         )
         _render_mask_editor_sliders()
 
@@ -906,13 +890,16 @@ def render_active_result_panel():
     if st.session_state.current_mask is None or st.session_state.last_result is None:
         return
 
-    computed = recompute_full_result(
-        st.session_state.current_mask,
-        st.session_state.current_pixels_per_cm,
-        st.session_state.height_threshold_cm,
-    )
-    render_result_visuals(st.session_state.current_image_bgr, st.session_state.current_mask, computed)
-    st.caption(f"ArUco 編號比對：{st.session_state.last_result.get('編號比對結果', '')}")
+    # 編輯視窗開啟時，不需要重複計算/繪製上方這三張大圖（使用者看到的是彈出視窗裡的預覽），
+    # 跳過可以省下每次互動都要重跑一次影像分析的時間。
+    if not st.session_state.editing_mode:
+        computed = recompute_full_result(
+            st.session_state.current_mask,
+            st.session_state.current_pixels_per_cm,
+            st.session_state.height_threshold_cm,
+        )
+        render_result_visuals(st.session_state.current_image_bgr, st.session_state.current_mask, computed)
+        st.caption(f"ArUco 編號比對：{st.session_state.last_result.get('編號比對結果', '')}")
 
     # ---------------- 筆刷編輯區塊 ----------------
     st.divider()
@@ -921,9 +908,6 @@ def render_active_result_panel():
         if not st.session_state.editing_mode:
             if st.button("✏️ 編輯遮罩", use_container_width=True, key="edit_mask_btn"):
                 st.session_state.mask_before_editing = st.session_state.current_mask.copy()
-                st.session_state.rect_first_corner = None
-                st.session_state.rect_second_corner = None
-                st.session_state.last_click_coords = None
                 st.session_state.editing_mode = True
                 st.rerun()
         else:
@@ -1698,14 +1682,18 @@ def main():
     backup_col1, backup_col2 = st.columns(2)
     with backup_col1:
         st.markdown("**⬇️ 匯出備份**")
-        backup_zip_bytes = build_full_backup_zip(st.session_state.dataframe)
-        st.download_button(
-            "📦 匯出完整備份（ZIP，含照片）",
-            data=backup_zip_bytes,
-            file_name=f"street_greening_full_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-            mime="application/zip",
-            use_container_width=True,
-        )
+        st.caption("先按下方按鈕產生備份檔（含所有照片，資料多時可能需要幾秒），完成後才會出現下載按鈕。")
+        if st.button("📦 產生備份檔案", use_container_width=True):
+            st.session_state.cached_backup_zip = build_full_backup_zip(st.session_state.dataframe)
+            st.session_state.cached_backup_zip_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if st.session_state.get("cached_backup_zip") is not None:
+            st.download_button(
+                "⬇️ 下載完整備份（ZIP，含照片）",
+                data=st.session_state.cached_backup_zip,
+                file_name=f"street_greening_full_backup_{st.session_state.cached_backup_zip_ts}.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
     with backup_col2:
         st.markdown("**⬆️ 匯入還原**")
         uploaded_backup = st.file_uploader("選擇備份 ZIP 檔案", type=["zip"], key="backup_zip_uploader")
@@ -1762,13 +1750,18 @@ def main():
                 use_container_width=True,
             )
         with exp_col2:
-            st.download_button(
-                "⬇️ 匯出為 Excel（備份）",
-                data=df_to_excel_bytes(df),
-                file_name=f"street_greening_survey_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+            st.caption("Excel 匯出資料量大時較耗時，按下方按鈕產生後才會出現下載按鈕。")
+            if st.button("📊 產生 Excel 檔案", use_container_width=True):
+                st.session_state.cached_excel_bytes = df_to_excel_bytes(df)
+                st.session_state.cached_excel_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            if st.session_state.get("cached_excel_bytes") is not None:
+                st.download_button(
+                    "⬇️ 下載 Excel（備份）",
+                    data=st.session_state.cached_excel_bytes,
+                    file_name=f"street_greening_survey_{st.session_state.cached_excel_ts}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
 
 
 
