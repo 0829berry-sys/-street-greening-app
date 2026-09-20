@@ -58,6 +58,8 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE_PATH = os.path.join(APP_DIR, "survey_database.csv")
 PHOTOS_DIR = os.path.join(APP_DIR, "survey_photos")
 os.makedirs(PHOTOS_DIR, exist_ok=True)
+MASKS_DIR = os.path.join(APP_DIR, "survey_masks")
+os.makedirs(MASKS_DIR, exist_ok=True)
 
 DATAFRAME_COLUMNS = [
     "捷運站",
@@ -87,6 +89,7 @@ DATAFRAME_COLUMNS = [
     "右區高度(cm)",
     "高低型態判定",
     "照片檔名",
+    "遮罩檔名",
     "紀錄時間",
 ]
 
@@ -181,11 +184,48 @@ def save_photo_file(image_bgr, point_id, timestamp_str):
         return ""
 
 
+def save_mask_file(mask, point_id, timestamp_str, existing_filename=None):
+    """
+    把「這筆紀錄最後編輯完成的遮罩」存成 PNG（無失真、單通道 0/255），
+    讓下次「載入這張照片以編輯遮罩」時可以接續上次編輯的結果，而不是每次都
+    用照片重新跑一次全新的辨識、蓋掉之前手動修過的地方。
+    若傳入 existing_filename，會直接覆寫同一個檔案（避免每編輯一次就多存一個檔案）。
+    """
+    if existing_filename:
+        filepath = os.path.join(MASKS_DIR, existing_filename)
+        try:
+            if imwrite_unicode(filepath, mask, ext=".png"):
+                return existing_filename
+        except Exception:
+            pass
+
+    safe_id = "".join(c for c in str(point_id) if c.isalnum() or c in ("-", "_")) or "point"
+    unique_token = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    filename = f"{safe_id}_{unique_token}_mask.png"
+    filepath = os.path.join(MASKS_DIR, filename)
+    if os.path.exists(filepath):
+        filename = f"{safe_id}_{unique_token}_{uuid.uuid4().hex[:6]}_mask.png"
+        filepath = os.path.join(MASKS_DIR, filename)
+    try:
+        ok = imwrite_unicode(filepath, mask, ext=".png")
+        return filename if ok else ""
+    except Exception:
+        return ""
+
+
+def load_mask_file(filename):
+    """讀回之前存的遮罩檔案，回傳單通道 0/255 numpy 陣列；找不到或讀取失敗回傳 None。"""
+    if not filename:
+        return None
+    filepath = os.path.join(MASKS_DIR, str(filename))
+    return imread_unicode(filepath, flags=cv2.IMREAD_GRAYSCALE)
+
+
 # ----------------------------------------------------------------------------
 # 完整備份／還原（ZIP，內含資料表 CSV ＋ 所有照片）
 # ----------------------------------------------------------------------------
 def build_full_backup_zip(df):
-    """把目前資料表與所有已存照片打包成一個 ZIP 檔案（bytes）。"""
+    """把目前資料表與所有已存照片、遮罩打包成一個 ZIP 檔案（bytes）。"""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("survey_database.csv", df.to_csv(index=False).encode("utf-8-sig"))
@@ -194,6 +234,11 @@ def build_full_backup_zip(df):
                 filepath = os.path.join(PHOTOS_DIR, filename)
                 if os.path.isfile(filepath):
                     zf.write(filepath, arcname=f"survey_photos/{filename}")
+        if os.path.isdir(MASKS_DIR):
+            for filename in os.listdir(MASKS_DIR):
+                filepath = os.path.join(MASKS_DIR, filename)
+                if os.path.isfile(filepath):
+                    zf.write(filepath, arcname=f"survey_masks/{filename}")
     buffer.seek(0)
     return buffer.getvalue()
 
@@ -233,6 +278,19 @@ def restore_from_backup_zip(zip_bytes, mode="replace"):
                         f_out.write(zf.read(name))
                     photo_count += 1
 
+            # 還原遮罩（舊版備份檔可能沒有這個資料夾，沒有的話就跳過，不影響照片與資料的還原）
+            os.makedirs(MASKS_DIR, exist_ok=True)
+            mask_count = 0
+            for name in namelist:
+                if name.startswith("survey_masks/") and not name.endswith("/"):
+                    target_filename = os.path.basename(name)
+                    if not target_filename:
+                        continue
+                    target_path = os.path.join(MASKS_DIR, target_filename)
+                    with open(target_path, "wb") as f_out:
+                        f_out.write(zf.read(name))
+                    mask_count += 1
+
             if mode == "replace":
                 final_df = restored_df
             else:
@@ -242,7 +300,7 @@ def restore_from_backup_zip(zip_bytes, mode="replace"):
 
             st.session_state.dataframe = final_df
             save_local_data(final_df)
-            return True, f"還原完成：共 {len(restored_df)} 筆資料、{photo_count} 張照片。"
+            return True, f"還原完成：共 {len(restored_df)} 筆資料、{photo_count} 張照片、{mask_count} 個遮罩。"
     except zipfile.BadZipFile:
         return False, "這個檔案不是有效的 ZIP 格式，請確認上傳的是本程式匯出的備份檔。"
     except Exception as e:
@@ -555,7 +613,7 @@ def imwrite_unicode(filepath, image_bgr, ext=".jpg"):
     return True
 
 
-def imread_unicode(filepath):
+def imread_unicode(filepath, flags=cv2.IMREAD_COLOR):
     """對應 imwrite_unicode 的讀取版本，同樣避開中文路徑的問題。"""
     if not filepath or not os.path.exists(filepath):
         return None
@@ -565,7 +623,7 @@ def imread_unicode(filepath):
         return None
     if data.size == 0:
         return None
-    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+    return cv2.imdecode(data, flags)
 
 
 def resize_for_canvas(image_bgr, max_width=CANVAS_MAX_WIDTH):
@@ -850,8 +908,23 @@ def render_active_result_panel():
             if st.button(save_label, type="primary", use_container_width=True, key="save_result_btn"):
                 point_id_for_photo = st.session_state.last_result.get("點位編號", "point")
                 ts = st.session_state.last_result.get("紀錄時間", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-                photo_filename = save_photo_file(st.session_state.current_image_bgr, point_id_for_photo, ts)
+
+                # 照片：如果是回頭編輯歷史紀錄、而且照片本身沒換過，就沿用原本的檔案，
+                # 不要每編輯一次就多存一份重複的照片。
+                existing_photo_filename = st.session_state.last_result.get("照片檔名", "")
+                if is_history_edit and existing_photo_filename:
+                    photo_filename = existing_photo_filename
+                else:
+                    photo_filename = save_photo_file(st.session_state.current_image_bgr, point_id_for_photo, ts)
                 st.session_state.last_result["照片檔名"] = photo_filename
+
+                # 遮罩：把這次編輯完成的最終遮罩存下來，下次載入才能接續編輯，而不是每次都重新分析。
+                existing_mask_filename = st.session_state.last_result.get("遮罩檔名", "")
+                mask_filename = save_mask_file(
+                    st.session_state.current_mask, point_id_for_photo, ts,
+                    existing_filename=existing_mask_filename if existing_mask_filename else None,
+                )
+                st.session_state.last_result["遮罩檔名"] = mask_filename
 
                 if is_history_edit:
                     idx = st.session_state.active_history_edit_index
@@ -1128,6 +1201,7 @@ def main():
                 "右區高度(cm)": computed["zone_heights_cm"].get("right"),
                 "高低型態判定": computed["shape_label"],
                 "照片檔名": "",
+                "遮罩檔名": "",
                 "紀錄時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
     # ==========================================================
@@ -1250,6 +1324,7 @@ def main():
                     empty_qty_b = int(float(matched_record.get("空盆栽數量", 0) or 0))
                     ts_b = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     photo_filename_b = save_photo_file(bulk_bgr, matched_record.get("點位編號", ""), ts_b)
+                    mask_filename_b = save_mask_file(mask_b, matched_record.get("點位編號", ""), ts_b)
 
                     row_b = {
                         "捷運站": matched_record.get("捷運站", ""),
@@ -1279,6 +1354,7 @@ def main():
                         "右區高度(cm)": computed_b["zone_heights_cm"].get("right"),
                         "高低型態判定": computed_b["shape_label"],
                         "照片檔名": photo_filename_b,
+                        "遮罩檔名": mask_filename_b,
                         "紀錄時間": ts_b,
                     }
                     st.session_state.dataframe = pd.concat(
@@ -1402,6 +1478,7 @@ def main():
                     "右區高度(cm)": computed_p["zone_heights_cm"].get("right"),
                     "高低型態判定": computed_p["shape_label"],
                     "照片檔名": "",
+                    "遮罩檔名": "",
                     "紀錄時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 st.rerun()
@@ -1482,6 +1559,11 @@ def main():
                 st.markdown(f"**盆栽數量合計（不含空盆）**：{record.get('擺放數量合計(不含空盆)', '')}")
                 st.markdown(f"**附註**：{record.get('附註', '')}")
                 st.markdown(f"**紀錄時間**：{record.get('紀錄時間', '')}")
+                mask_on_file = record.get("遮罩檔名", "")
+                if mask_on_file and os.path.exists(os.path.join(MASKS_DIR, str(mask_on_file))):
+                    st.success("🖌️ 這筆已經手動編輯過遮罩")
+                else:
+                    st.caption("這筆還沒有手動編輯過遮罩")
             with detail_col2:
                 photo_filename = record.get("照片檔名", "")
                 photo_path = os.path.join(PHOTOS_DIR, str(photo_filename)) if photo_filename else ""
@@ -1515,11 +1597,18 @@ def main():
                                 "可以試試看用左邊「重新上傳這筆的照片」換一張。"
                             )
                         else:
-                            if green_method == "HSV 色彩閾值":
-                                raw_mask_h = extract_green_mask_hsv(loaded_bgr, h_low, h_high, s_low, v_low)
-                            else:
-                                raw_mask_h = extract_green_mask_exg(loaded_bgr, exg_threshold)
-                            mask_h = clean_mask(raw_mask_h, kernel_size=morph_kernel)
+                            # 優先讀回「上次編輯完成後存下來的遮罩」，才不會每次都用照片重新跑一次
+                            # 全新的辨識、蓋掉之前手動修過的地方；只有從來沒存過遮罩的舊資料，
+                            # 才退回用目前的影像分析參數重新產生一份。
+                            saved_mask_filename = record.get("遮罩檔名", "")
+                            mask_h = load_mask_file(saved_mask_filename) if saved_mask_filename else None
+
+                            if mask_h is None:
+                                if green_method == "HSV 色彩閾值":
+                                    raw_mask_h = extract_green_mask_hsv(loaded_bgr, h_low, h_high, s_low, v_low)
+                                else:
+                                    raw_mask_h = extract_green_mask_exg(loaded_bgr, exg_threshold)
+                                mask_h = clean_mask(raw_mask_h, kernel_size=morph_kernel)
 
                             # 比例尺優先沿用這筆紀錄原本存的像素/公分比例尺；沒有的話才重新偵測 ArUco
                             stored_scale = None
@@ -1542,7 +1631,7 @@ def main():
                             st.session_state.active_batch_pending_id = None
                             st.session_state.editing_mode = False
                             st.rerun()
-                    st.caption("用目前側邊欄的影像分析參數重新產生遮罩（不一定跟當初存檔時完全相同），可以在下方微調後更新這筆紀錄。")
+                    st.caption("有存過編輯紀錄的話，會載入上次編輯完成的遮罩接續調整；沒有的話才會用目前的影像分析參數重新產生。")
 
             if st.session_state.active_history_edit_index == record_index:
                 render_active_result_panel()
