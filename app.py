@@ -139,7 +139,7 @@ TEMPLATE_COLUMNS = [
     "ArUco邊長(cm)", "附註",
 ]
 
-CANVAS_MAX_WIDTH = 850  # 遮罩編輯預覽圖的最大寬度（像素）
+CANVAS_MAX_WIDTH = 1050  # 遮罩編輯預覽圖的最大寬度（像素）
 
 
 # ----------------------------------------------------------------------------
@@ -275,6 +275,8 @@ def init_session_state():
         st.session_state.canvas_key_counter = 0
     if "mask_before_editing" not in st.session_state:
         st.session_state.mask_before_editing = None
+    if "last_applied_box" not in st.session_state:
+        st.session_state.last_applied_box = None
     if "height_threshold_cm" not in st.session_state:
         st.session_state.height_threshold_cm = HEIGHT_LEVEL_THRESHOLD_DEFAULT
     if "pending_records" not in st.session_state:
@@ -748,44 +750,75 @@ def _get_box_value(box, *keys, default=0):
 def _render_mask_editor_drag():
     """按住滑鼠左鍵拖曳圈選矩形（主要方式，需要 streamlit-cropper 套件）。"""
     st.info(
-        "🖱️ 直接在下方照片上**按住滑鼠左鍵拖曳**，圈出一個矩形範圍，放開滑鼠後範圍就會固定。"
-        "選擇要「新增」還是「移除」，按「➕ 套用這個矩形」即可疊加到遮罩上；"
-        "可以連續圈選、套用多個矩形來組合出想要的形狀。"
+        "🖱️ 先在右側選擇「新增」或「移除」，再到左邊照片上**按住滑鼠左鍵拖曳**圈出範圍，"
+        "**放開滑鼠就會立即套用**（不用再另外按套用按鈕）。可以重複拖曳多次來組合出想要的形狀。"
     )
 
-    mode = st.radio("這個矩形要做什麼", ["新增到綠化面積（綠框）", "從綠化面積移除（紅框）"], horizontal=True, key="rect_mode")
-    box_color_hex = "#00FF00" if mode.startswith("新增") else "#FF0000"
+    img_col, ctrl_col = st.columns([3, 1])
 
-    overlay = st.session_state.current_image_bgr.copy()
-    overlay[st.session_state.current_mask > 0] = (0, 255, 0)
-    blend = cv2.addWeighted(st.session_state.current_image_bgr, 0.5, overlay, 0.5, 0)
-    preview_base = resize_for_canvas(blend, max_width=CANVAS_MAX_WIDTH)
-    disp_h, disp_w = preview_base.shape[:2]
-    orig_h, orig_w = st.session_state.current_mask.shape[:2]
-    scale_x = orig_w / disp_w
-    scale_y = orig_h / disp_h
+    with ctrl_col:
+        mode = st.radio("這次要", ["新增（綠框）", "移除（紅框）"], key="rect_mode")
+        st.caption("放開滑鼠＝立即套用到遮罩")
+        st.divider()
+        if st.button("↩️ 復原全部編輯", use_container_width=True):
+            st.session_state.current_mask = st.session_state.mask_before_editing.copy()
+            st.session_state.canvas_key_counter += 1
+            st.session_state.last_applied_box = None
+            st.rerun()
+        if st.button("✅ 完成編輯", type="primary", use_container_width=True):
+            final_computed = recompute_full_result(
+                st.session_state.current_mask,
+                st.session_state.current_pixels_per_cm,
+                st.session_state.height_threshold_cm,
+            )
+            lr = st.session_state.last_result
+            lr["AI辨識綠化面積(m2)"] = round(final_computed["area_m2"], 4) if final_computed["area_m2"] is not None else None
+            lr["左區高度(cm)"] = final_computed["zone_heights_cm"].get("left")
+            lr["中區高度(cm)"] = final_computed["zone_heights_cm"].get("mid")
+            lr["右區高度(cm)"] = final_computed["zone_heights_cm"].get("right")
+            lr["高低型態判定"] = final_computed["shape_label"]
+            st.session_state.last_result = lr
+            st.session_state.editing_mode = False
+            st.rerun()
+        if st.button("❌ 放棄並關閉", use_container_width=True):
+            st.session_state.current_mask = st.session_state.mask_before_editing.copy()
+            st.session_state.editing_mode = False
+            st.rerun()
 
-    pil_preview = Image.fromarray(bgr_to_rgb_for_display(preview_base))
+    with img_col:
+        box_color_hex = "#00FF00" if mode.startswith("新增") else "#FF0000"
 
-    # realtime_update=False：只有放開滑鼠、圈選結束時才會觸發一次更新，
-    # 拖曳過程中不會一直重新整理頁面。
-    box = st_cropper(
-        pil_preview,
-        realtime_update=False,
-        box_color=box_color_hex,
-        aspect_ratio=None,
-        return_type="box",
-        key=f"mask_cropper_{st.session_state.canvas_key_counter}",
-    )
+        overlay = st.session_state.current_image_bgr.copy()
+        overlay[st.session_state.current_mask > 0] = (0, 255, 0)
+        blend = cv2.addWeighted(st.session_state.current_image_bgr, 0.5, overlay, 0.5, 0)
+        preview_base = resize_for_canvas(blend, max_width=CANVAS_MAX_WIDTH)
+        disp_h, disp_w = preview_base.shape[:2]
+        orig_h, orig_w = st.session_state.current_mask.shape[:2]
+        scale_x = orig_w / disp_w
+        scale_y = orig_h / disp_h
 
-    left = int(_get_box_value(box, "left", "x"))
-    top = int(_get_box_value(box, "top", "y"))
-    width = int(_get_box_value(box, "width", "w", default=0))
-    height = int(_get_box_value(box, "height", "h", default=0))
+        pil_preview = Image.fromarray(bgr_to_rgb_for_display(preview_base))
 
-    apply_col, _ = st.columns(2)
-    with apply_col:
-        if st.button("➕ 套用這個矩形", type="primary", use_container_width=True, disabled=(width <= 0 or height <= 0)):
+        # realtime_update=False：只有放開滑鼠、圈選結束時才會觸發一次更新，
+        # 拖曳過程中不會一直重新整理頁面。
+        box = st_cropper(
+            pil_preview,
+            realtime_update=False,
+            box_color=box_color_hex,
+            aspect_ratio=None,
+            return_type="box",
+            key=f"mask_cropper_{st.session_state.canvas_key_counter}",
+        )
+
+        left = int(_get_box_value(box, "left", "x"))
+        top = int(_get_box_value(box, "top", "y"))
+        width = int(_get_box_value(box, "width", "w", default=0))
+        height = int(_get_box_value(box, "height", "h", default=0))
+        box_signature = (left, top, width, height)
+
+        # 只要偵測到「跟上次套用過的不一樣」的框選範圍，就立即套用，
+        # 不透過另一個按鈕點擊去讀取（避免元件在下一次互動時把框選狀態重置的問題）。
+        if width > 0 and height > 0 and box_signature != st.session_state.get("last_applied_box"):
             x0, x1 = int(left * scale_x), int((left + width) * scale_x)
             y0, y1 = int(top * scale_y), int((top + height) * scale_y)
             new_mask = st.session_state.current_mask.copy()
@@ -794,11 +827,9 @@ def _render_mask_editor_drag():
             else:
                 new_mask[y0:y1, x0:x1] = 0
             st.session_state.current_mask = new_mask
+            st.session_state.last_applied_box = box_signature
             st.session_state.canvas_key_counter += 1
             st.rerun()
-
-    st.divider()
-    _render_finish_revert_cancel_buttons()
 
 
 def _render_mask_editor_sliders():
@@ -908,6 +939,7 @@ def render_active_result_panel():
         if not st.session_state.editing_mode:
             if st.button("✏️ 編輯遮罩", use_container_width=True, key="edit_mask_btn"):
                 st.session_state.mask_before_editing = st.session_state.current_mask.copy()
+                st.session_state.last_applied_box = None
                 st.session_state.editing_mode = True
                 st.rerun()
         else:
