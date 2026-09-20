@@ -27,6 +27,7 @@ Streamlit + OpenCV 電腦視覺應用程式
 
 import io
 import os
+import zipfile
 from datetime import datetime
 
 import cv2
@@ -42,6 +43,10 @@ try:
     CANVAS_AVAILABLE = True
 except ImportError:
     CANVAS_AVAILABLE = False
+
+# st.dialog（彈出視窗）是較新版本 Streamlit 才有的功能，這裡做版本相容處理
+DIALOG_DECORATOR = getattr(st, "dialog", None) or getattr(st, "experimental_dialog", None)
+DIALOG_SUPPORTED = DIALOG_DECORATOR is not None
 
 matplotlib.rcParams["axes.unicode_minus"] = False
 
@@ -121,7 +126,8 @@ HEIGHT_LEVEL_THRESHOLD_DEFAULT = 5.0  # 公分，判斷「高/低」是否有顯
 LOCATION_OPTIONS = ["路邊", "門口", "路口轉角", "騎樓", "其他"]
 ARRANGEMENT_OPTIONS = ["橫向擺放", "直列擺放", "群聚擺放", "單盆擺放"]
 
-CANVAS_MAX_WIDTH = 640  # 編輯畫布最大寬度（像素），避免畫面過大
+CANVAS_MAX_WIDTH = 850  # 彈出視窗中編輯畫布的最大寬度（像素）
+REFERENCE_THUMB_MAX_WIDTH = 240  # 彈出視窗中「原始照片」參考縮圖的最大寬度
 
 
 # ----------------------------------------------------------------------------
@@ -161,6 +167,74 @@ def save_photo_file(image_bgr, point_id, timestamp_str):
         return filename
     except Exception:
         return ""
+
+
+# ----------------------------------------------------------------------------
+# 完整備份／還原（ZIP，內含資料表 CSV ＋ 所有照片）
+# ----------------------------------------------------------------------------
+def build_full_backup_zip(df):
+    """把目前資料表與所有已存照片打包成一個 ZIP 檔案（bytes）。"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("survey_database.csv", df.to_csv(index=False).encode("utf-8-sig"))
+        if os.path.isdir(PHOTOS_DIR):
+            for filename in os.listdir(PHOTOS_DIR):
+                filepath = os.path.join(PHOTOS_DIR, filename)
+                if os.path.isfile(filepath):
+                    zf.write(filepath, arcname=f"survey_photos/{filename}")
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def restore_from_backup_zip(zip_bytes, mode="replace"):
+    """
+    從備份 ZIP 還原資料表與照片。
+    mode="replace"：完全取代目前資料與照片
+    mode="merge"：把備份中的資料附加到目前資料表後面（照片一律複製進來，同檔名會被覆蓋）
+    回傳 (success: bool, message: str)
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            namelist = zf.namelist()
+            if "survey_database.csv" not in namelist:
+                return False, "這個 ZIP 檔案裡找不到 survey_database.csv，不是本程式匯出的備份檔。"
+
+            csv_bytes = zf.read("survey_database.csv")
+            restored_df = pd.read_csv(io.BytesIO(csv_bytes), dtype=str, keep_default_na=False)
+            for col in DATAFRAME_COLUMNS:
+                if col not in restored_df.columns:
+                    restored_df[col] = ""
+            restored_df = restored_df[DATAFRAME_COLUMNS]
+            for col in NUMERIC_COLS_FOR_STATS:
+                restored_df[col] = pd.to_numeric(restored_df[col], errors="coerce")
+
+            # 還原照片
+            os.makedirs(PHOTOS_DIR, exist_ok=True)
+            photo_count = 0
+            for name in namelist:
+                if name.startswith("survey_photos/") and not name.endswith("/"):
+                    target_filename = os.path.basename(name)
+                    if not target_filename:
+                        continue
+                    target_path = os.path.join(PHOTOS_DIR, target_filename)
+                    with open(target_path, "wb") as f_out:
+                        f_out.write(zf.read(name))
+                    photo_count += 1
+
+            if mode == "replace":
+                final_df = restored_df
+            else:
+                final_df = pd.concat(
+                    [st.session_state.dataframe, restored_df], ignore_index=True
+                )
+
+            st.session_state.dataframe = final_df
+            save_local_data(final_df)
+            return True, f"還原完成：共 {len(restored_df)} 筆資料、{photo_count} 張照片。"
+    except zipfile.BadZipFile:
+        return False, "這個檔案不是有效的 ZIP 格式，請確認上傳的是本程式匯出的備份檔。"
+    except Exception as e:
+        return False, f"還原時發生錯誤：{e}"
 
 
 # ----------------------------------------------------------------------------
@@ -431,6 +505,11 @@ def bgr_to_rgb_for_display(bgr_image):
     return cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
 
 
+def mask_to_bgr_image(mask):
+    """把單通道 0/255 遮罩轉成可以當畫布背景的黑白三通道圖片。"""
+    return cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+
+
 def resize_for_canvas(image_bgr, max_width=CANVAS_MAX_WIDTH):
     h, w = image_bgr.shape[:2]
     if w <= max_width:
@@ -541,6 +620,109 @@ def render_result_visuals(image_bgr, mask, computed):
 
 
 # ----------------------------------------------------------------------------
+# 筆刷編輯視窗（彈出對話框；直接對「遮罩」本身進行編輯）
+# ----------------------------------------------------------------------------
+def _render_mask_editor_body():
+    if not CANVAS_AVAILABLE:
+        st.error(
+            "尚未安裝筆刷編輯所需套件，請於終端機執行："
+            "pip install streamlit-drawable-canvas 後重新啟動程式。"
+        )
+        if st.button("關閉視窗"):
+            st.session_state.editing_mode = False
+            st.rerun()
+        return
+
+    st.info(
+        "🖌️ 這裡顯示的是程式判斷出來的「遮罩」本身（白色＝目前判定為植栽，黑色＝背景）。"
+        "用滑鼠塗抹：**綠色筆刷＝新增到綠化面積**、**紅色筆刷＝從綠化面積移除**。"
+        "塗抹完按「🔄 重新計算」套用並預覽，滿意後按「✅ 完成編輯」才會固定最終結果並可以儲存。"
+    )
+    ctrl_col1, ctrl_col2 = st.columns(2)
+    with ctrl_col1:
+        brush_mode = st.radio("筆刷模式", ["新增（綠色）", "移除（紅色）"], horizontal=True)
+    with ctrl_col2:
+        brush_size = st.slider("筆刷大小", 5, 80, 25)
+
+    # 筆刷透明度固定 50%，塗抹時仍能同時看到底下的遮罩
+    stroke_color = "rgba(0, 255, 0, 0.5)" if brush_mode.startswith("新增") else "rgba(255, 0, 0, 0.5)"
+
+    mask_display = mask_to_bgr_image(st.session_state.current_mask)
+    preview_mask_img = resize_for_canvas(mask_display, max_width=CANVAS_MAX_WIDTH)
+    ref_photo_small = resize_for_canvas(st.session_state.current_image_bgr, max_width=REFERENCE_THUMB_MAX_WIDTH)
+
+    canvas_col, ref_col = st.columns([3, 1])
+    with canvas_col:
+        st.caption("在這裡直接對遮罩塗抹")
+        canvas_bg = Image.fromarray(bgr_to_rgb_for_display(preview_mask_img))
+        canvas_result = st_canvas(
+            fill_color="rgba(0,0,0,0)",
+            stroke_width=brush_size,
+            stroke_color=stroke_color,
+            background_image=canvas_bg,
+            update_streamlit=True,
+            height=preview_mask_img.shape[0],
+            width=preview_mask_img.shape[1],
+            drawing_mode="freedraw",
+            key=f"mask_editor_canvas_{st.session_state.canvas_key_counter}",
+        )
+    with ref_col:
+        st.caption("原始照片（參考）")
+        st.image(bgr_to_rgb_for_display(ref_photo_small), use_container_width=True)
+
+    recalc_col, finish_col, cancel_col = st.columns(3)
+    with recalc_col:
+        if st.button("🔄 重新計算", use_container_width=True):
+            image_data = get_canvas_image_data(canvas_result)
+            if image_data is not None:
+                st.session_state.current_mask = apply_canvas_strokes_to_mask(
+                    st.session_state.current_mask, image_data
+                )
+                st.session_state.canvas_key_counter += 1  # 清空畫布，避免重複套用同一筆筆刷
+            st.rerun()
+    with finish_col:
+        if st.button("✅ 完成編輯", type="primary", use_container_width=True):
+            image_data = get_canvas_image_data(canvas_result)
+            if image_data is not None:
+                st.session_state.current_mask = apply_canvas_strokes_to_mask(
+                    st.session_state.current_mask, image_data
+                )
+            final_computed = recompute_full_result(
+                st.session_state.current_mask,
+                st.session_state.current_pixels_per_cm,
+                st.session_state.height_threshold_cm,
+            )
+            lr = st.session_state.last_result
+            lr["AI辨識綠化面積(m2)"] = round(final_computed["area_m2"], 4) if final_computed["area_m2"] is not None else None
+            lr["左區高度(cm)"] = final_computed["zone_heights_cm"].get("left")
+            lr["中區高度(cm)"] = final_computed["zone_heights_cm"].get("mid")
+            lr["右區高度(cm)"] = final_computed["zone_heights_cm"].get("right")
+            lr["高低型態判定"] = final_computed["shape_label"]
+            st.session_state.last_result = lr
+            st.session_state.editing_mode = False
+            st.session_state.canvas_key_counter += 1
+            st.rerun()
+    with cancel_col:
+        if st.button("❌ 關閉（不套用尚未計算的筆刷）", use_container_width=True):
+            st.session_state.editing_mode = False
+            st.session_state.canvas_key_counter += 1
+            st.rerun()
+
+
+if DIALOG_SUPPORTED:
+    @DIALOG_DECORATOR("✏️ 編輯遮罩", width="large")
+    def mask_editor_dialog():
+        _render_mask_editor_body()
+else:
+    def mask_editor_dialog():
+        st.warning(
+            "目前 Streamlit 版本不支援彈出視窗，請執行「pip install --upgrade streamlit」升級後即可使用彈出式編輯視窗。"
+            "以下暫時以原地展開的方式編輯："
+        )
+        _render_mask_editor_body()
+
+
+# ----------------------------------------------------------------------------
 # 主程式
 # ----------------------------------------------------------------------------
 def main():
@@ -567,6 +749,12 @@ def main():
             except Exception:
                 st.error("照片讀取失敗，請確認檔案格式")
 
+        if uploaded_file is not None:
+            if ids_found:
+                st.success(f"📷 已偵測到 ArUco，ID：{'、'.join(str(i) for i in ids_found)}")
+            else:
+                st.warning("📷 未偵測到 ArUco 標記，請確認畫面中是否有清楚拍到")
+
         with st.expander("📏 名詞說明（拍照距離 / 占用深度 / ArUco 擺放位置）"):
             st.markdown(
                 "- **拍照距離**：相機鏡頭到「建築外牆」的距離。\n"
@@ -576,111 +764,100 @@ def main():
             )
 
         st.divider()
-        st.header("📋 點位屬性輸入")
+        st.caption("以下欄位填寫時不會立即重新整理，全部填好後按最下方「執行影像分析」才會一次讀取。")
 
-        mrt_station = st.text_input("捷運站", placeholder="請手動輸入，例如：忠孝復興站")
+        with st.form("point_attribute_form", clear_on_submit=False):
+            st.header("📋 點位屬性輸入")
 
-        point_id = st.text_input("點位編號（Point ID）", value="")
-        if uploaded_file is not None:
-            match_msg, match_status = build_aruco_match_message(point_id, ids_found)
-            if match_status == "相符":
-                st.success(f"📷 {match_msg}")
-            elif match_status == "不符":
-                st.warning(f"📷 {match_msg}")
-            elif match_status == "未偵測到":
-                st.warning(f"📷 {match_msg}，請確認畫面中是否有清楚拍到 ArUco 標記")
-            else:
-                st.info(f"📷 {match_msg}")
-        else:
-            match_msg, match_status = "尚未上傳照片，無法自動比對 ArUco 編號", "未上傳"
-            st.caption(f"📷 {match_msg}")
+            mrt_station = st.text_input("捷運站", placeholder="請手動輸入，例如：忠孝復興站")
+            point_id = st.text_input("點位編號（Point ID）", value="")
 
-        shooting_distance = st.number_input(
-            "拍照距離（公尺，以 0.5m 為單位）",
-            min_value=0.5, max_value=50.0, value=3.0, step=0.5, format="%.1f",
-            help="相機鏡頭到「建築外牆」的距離。",
-        )
+            shooting_distance = st.number_input(
+                "拍照距離（公尺，以 0.5m 為單位）",
+                min_value=0.5, max_value=50.0, value=3.0, step=0.5, format="%.1f",
+                help="相機鏡頭到「建築外牆」的距離。",
+            )
 
-        location_type_raw = st.selectbox("擺放位置", LOCATION_OPTIONS)
+            location_type_raw = st.selectbox("擺放位置", LOCATION_OPTIONS)
+            location_type_other = st.text_input(
+                "若擺放位置選「其他」，請在這裡填寫", key="location_other",
+                help="僅在上方「擺放位置」選擇『其他』時才會使用這裡填寫的內容。",
+            )
+
+            arrangement_type = st.selectbox("盆栽擺放型態", ARRANGEMENT_OPTIONS)
+
+            st.markdown("**現場實測最高高度（公分）— 依擺放方式分別填寫**")
+            h1, h2, h3 = st.columns(3)
+            with h1:
+                floor_height_cm = st.number_input("落地擺放", min_value=0.0, max_value=500.0, value=0.0, step=1.0, key="floor_h")
+            with h2:
+                hanging_height_cm = st.number_input("吊掛擺放", min_value=0.0, max_value=500.0, value=0.0, step=1.0, key="hang_h")
+            with h3:
+                upward_height_cm = st.number_input("向上擺放", min_value=0.0, max_value=500.0, value=0.0, step=1.0, key="up_h")
+
+            occupancy_depth_cm = st.number_input(
+                "盆栽占用深度（公分）", min_value=0.0, max_value=500.0, value=0.0, step=1.0,
+                help="盆栽最外側（含枝條葉子）到「建築外牆」的距離。",
+            )
+
+            st.markdown("**盆栽擺放數量（盆）**")
+            q1, q2, q3, q4 = st.columns(4)
+            with q1:
+                floor_qty = st.number_input("落地", min_value=0, value=0, step=1, key="floor_q")
+            with q2:
+                hanging_qty = st.number_input("吊掛", min_value=0, value=0, step=1, key="hang_q")
+            with q3:
+                upward_qty = st.number_input("向上", min_value=0, value=0, step=1, key="up_q")
+            with q4:
+                empty_qty = st.number_input("空盆栽", min_value=0, value=0, step=1, key="empty_q")
+
+            st.caption("（數量合計會在按下「執行影像分析」後，於下方結果中顯示）")
+
+            note_text = st.text_area("附註（選填）", value="", placeholder="其他需要記錄的現場觀察...")
+
+            marker_real_length_cm = st.number_input(
+                "ArUco 實際邊長（公分）", min_value=1.0, max_value=100.0, value=20.0, step=0.5,
+                help="ArUco 標記本身的實際邊長，貼放於該點位盆栽最外側，作為比例尺校正基準。",
+            )
+
+            st.divider()
+            st.header("🎨 影像分析參數")
+
+            green_method = st.radio(
+                "綠色遮罩演算法", ["HSV 色彩閾值", "Excess Green Index (ExG)"],
+                help="決定用哪一種方式從照片中判斷「哪些像素是植栽的綠色」。HSV 用色相/飽和度/明度範圍篩選；ExG 用增強綠色的指數，對光線變化較不敏感。",
+            )
+
+            h_low = st.slider("Hue 下限（僅 HSV 模式使用）", 0, 179, 35, help="色相（顏色種類）篩選範圍的下限，數值越低越偏黃綠。")
+            h_high = st.slider("Hue 上限（僅 HSV 模式使用）", 0, 179, 85, help="色相篩選範圍的上限，數值越高越偏藍綠。")
+            s_low = st.slider("Saturation 下限（僅 HSV 模式使用）", 0, 255, 40, help="飽和度下限，數值越低會連同較淡、較灰的顏色也判定為植栽。")
+            v_low = st.slider("Value 下限（僅 HSV 模式使用）", 0, 255, 40, help="明度下限，數值越低會連同較暗的陰影植栽也判定為植栽。")
+            exg_threshold = st.slider("ExG 二值化閾值（僅 ExG 模式使用）", 0, 255, 130, help="數值越高，判定為植栽的門檻越嚴格，抓到的綠色範圍會變小。")
+
+            morph_kernel = st.slider(
+                "形態學去雜訊核大小", 1, 15, 5, step=2,
+                help="用來去除遮罩上的小雜點、填補小空洞的運算範圍，數值越大平滑效果越強，但也可能抹掉細小的植栽枝葉。",
+            )
+            height_threshold_cm = st.slider(
+                "高低型態判定閾值（公分）", 1.0, 20.0, HEIGHT_LEVEL_THRESHOLD_DEFAULT, step=0.5,
+                help="左/中/右三區高度要相差多少公分以上，才會被視為有明顯的「高、低」差異，藉此判斷擺放立面形式。",
+            )
+
+            st.divider()
+            manual_scale_override = st.number_input(
+                "手動輸入比例尺（像素/公分）— 僅於 ArUco 未偵測到時使用，0 表示不啟用",
+                min_value=0.0, value=0.0, step=0.1,
+                help="當照片中沒有清楚偵測到 ArUco 標記時，可以自己估算「畫面中多少像素等於 1 公分」，手動輸入來替代自動校正。",
+            )
+
+            run_analysis = st.form_submit_button("🚀 執行影像分析", use_container_width=True, type="primary")
+
         if location_type_raw == "其他":
-            location_type_other = st.text_input("請手動輸入擺放位置（其他）", key="location_other")
             location_type_final = location_type_other.strip() if location_type_other.strip() else "其他（未填寫）"
         else:
             location_type_final = location_type_raw
 
-        arrangement_type = st.selectbox("盆栽擺放型態", ARRANGEMENT_OPTIONS)
-
-        st.markdown("**現場實測最高高度（公分）— 依擺放方式分別填寫**")
-        h1, h2, h3 = st.columns(3)
-        with h1:
-            floor_height_cm = st.number_input("落地擺放", min_value=0.0, max_value=500.0, value=0.0, step=1.0, key="floor_h")
-        with h2:
-            hanging_height_cm = st.number_input("吊掛擺放", min_value=0.0, max_value=500.0, value=0.0, step=1.0, key="hang_h")
-        with h3:
-            upward_height_cm = st.number_input("向上擺放", min_value=0.0, max_value=500.0, value=0.0, step=1.0, key="up_h")
-
-        occupancy_depth_cm = st.number_input(
-            "盆栽占用深度（公分）", min_value=0.0, max_value=500.0, value=0.0, step=1.0,
-            help="盆栽最外側（含枝條葉子）到「建築外牆」的距離。",
-        )
-
-        st.markdown("**盆栽擺放數量（盆）**")
-        q1, q2, q3, q4 = st.columns(4)
-        with q1:
-            floor_qty = st.number_input("落地", min_value=0, value=0, step=1, key="floor_q")
-        with q2:
-            hanging_qty = st.number_input("吊掛", min_value=0, value=0, step=1, key="hang_q")
-        with q3:
-            upward_qty = st.number_input("向上", min_value=0, value=0, step=1, key="up_q")
-        with q4:
-            empty_qty = st.number_input("空盆栽", min_value=0, value=0, step=1, key="empty_q")
-
         total_qty_excl_empty = floor_qty + hanging_qty + upward_qty
-        st.info(f"➕ 盆栽數量合計（不含空盆）：**{total_qty_excl_empty}** 盆　｜　空盆栽數量：**{empty_qty}** 盆")
-
-        note_text = st.text_area("附註（選填）", value="", placeholder="其他需要記錄的現場觀察...")
-
-        marker_real_length_cm = st.number_input(
-            "ArUco 實際邊長（公分）", min_value=1.0, max_value=100.0, value=20.0, step=0.5,
-            help="ArUco 標記本身的實際邊長，貼放於該點位盆栽最外側，作為比例尺校正基準。",
-        )
-
-        st.divider()
-        st.header("🎨 影像分析參數")
-
-        green_method = st.radio(
-            "綠色遮罩演算法", ["HSV 色彩閾值", "Excess Green Index (ExG)"],
-            help="決定用哪一種方式從照片中判斷「哪些像素是植栽的綠色」。HSV 用色相/飽和度/明度範圍篩選；ExG 用增強綠色的指數，對光線變化較不敏感。",
-        )
-
-        if green_method == "HSV 色彩閾值":
-            h_low = st.slider("Hue 下限", 0, 179, 35, help="色相（顏色種類）篩選範圍的下限，數值越低越偏黃綠。")
-            h_high = st.slider("Hue 上限", 0, 179, 85, help="色相篩選範圍的上限，數值越高越偏藍綠。")
-            s_low = st.slider("Saturation 下限", 0, 255, 40, help="飽和度下限，數值越低會連同較淡、較灰的顏色也判定為植栽。")
-            v_low = st.slider("Value 下限", 0, 255, 40, help="明度下限，數值越低會連同較暗的陰影植栽也判定為植栽。")
-            exg_threshold = None
-        else:
-            exg_threshold = st.slider("ExG 二值化閾值", 0, 255, 130, help="數值越高，判定為植栽的門檻越嚴格，抓到的綠色範圍會變小。")
-            h_low = h_high = s_low = v_low = None
-
-        morph_kernel = st.slider(
-            "形態學去雜訊核大小", 1, 15, 5, step=2,
-            help="用來去除遮罩上的小雜點、填補小空洞的運算範圍，數值越大平滑效果越強，但也可能抹掉細小的植栽枝葉。",
-        )
-        height_threshold_cm = st.slider(
-            "高低型態判定閾值（公分）", 1.0, 20.0, st.session_state.height_threshold_cm, step=0.5,
-            help="左/中/右三區高度要相差多少公分以上，才會被視為有明顯的「高、低」差異，藉此判斷擺放立面形式。",
-        )
-        st.session_state.height_threshold_cm = height_threshold_cm
-
-        st.divider()
-        manual_scale_override = st.number_input(
-            "手動輸入比例尺（像素/公分）— 僅於 ArUco 未偵測到時使用，0 表示不啟用",
-            min_value=0.0, value=0.0, step=0.1,
-            help="當照片中沒有清楚偵測到 ArUco 標記時，可以自己估算「畫面中多少像素等於 1 公分」，手動輸入來替代自動校正。",
-        )
-
-        run_analysis = st.button("🚀 執行影像分析", use_container_width=True, type="primary")
 
     # ==========================================================
     # 主畫面：影像分析流程（初次分析）
@@ -716,10 +893,14 @@ def main():
 
             mask = clean_mask(raw_mask, kernel_size=morph_kernel)
 
-            # 將本次分析的原圖 / 遮罩 / 比例尺存入 session_state，供筆刷編輯與重新計算使用
+            match_msg, match_status = build_aruco_match_message(point_id, ids_found)
+
+            # 將本次分析的原圖 / 遮罩 / 比例尺 / 判定閾值存入 session_state，
+            # 供筆刷編輯與重新計算使用（閾值滑桿在表單內，僅在送出當下的值會生效）
             st.session_state.current_image_bgr = image_bgr
             st.session_state.current_mask = mask
             st.session_state.current_pixels_per_cm = pixels_per_cm
+            st.session_state.height_threshold_cm = height_threshold_cm
             st.session_state.editing_mode = False
             st.session_state.canvas_key_counter += 1
 
@@ -754,8 +935,6 @@ def main():
                 "照片檔名": "",
                 "紀錄時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
-            st.session_state._point_id_for_save = point_id
-
     # ==========================================================
     # 分析結果顯示（每次 rerun 都依 session_state 目前的 mask 重新畫）
     # ==========================================================
@@ -777,90 +956,10 @@ def main():
                     st.session_state.editing_mode = True
                     st.rerun()
             else:
-                st.caption("編輯中…")
+                st.caption("編輯中…（請在彈出視窗中操作）")
 
         if st.session_state.editing_mode:
-            if not CANVAS_AVAILABLE:
-                st.error(
-                    "尚未安裝筆刷編輯所需套件，請於終端機執行："
-                    "pip install streamlit-drawable-canvas 後重新啟動程式。"
-                )
-                if st.button("結束編輯（返回原始結果）"):
-                    st.session_state.editing_mode = False
-                    st.rerun()
-            else:
-                st.info(
-                    "🖌️ 用滑鼠在下方畫布上塗抹：**綠色筆刷＝新增到綠化面積**、"
-                    "**紅色筆刷＝從綠化面積移除**。塗抹完按「🔄 重新計算」套用並預覽，"
-                    "滿意後按「✅ 完成編輯」才會固定最終結果並可以儲存。"
-                )
-                brush_mode = st.radio("筆刷模式", ["新增（綠色）", "移除（紅色）"], horizontal=True)
-                brush_size = st.slider("筆刷大小", 5, 60, 20)
-                # 筆刷透明度固定 50%，塗抹時才能同時看到底圖與畫到的範圍
-                stroke_color = "rgba(0, 255, 0, 0.5)" if brush_mode.startswith("新增") else "rgba(255, 0, 0, 0.5)"
-
-                preview_bgr = resize_for_canvas(st.session_state.current_image_bgr)
-                reference_mask_blend = preview_bgr.copy()
-                preview_mask = cv2.resize(
-                    st.session_state.current_mask,
-                    (preview_bgr.shape[1], preview_bgr.shape[0]),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-                reference_mask_blend[preview_mask > 0] = (0, 255, 0)
-                reference_mask_blend = cv2.addWeighted(preview_bgr, 0.5, reference_mask_blend, 0.5, 0)
-
-                canvas_col, ref_col = st.columns([2, 1])
-                with canvas_col:
-                    st.caption("在這裡塗抹（綠色筆刷＝新增，紅色筆刷＝移除）")
-                    canvas_bg = Image.fromarray(bgr_to_rgb_for_display(preview_bgr))
-                    canvas_result = st_canvas(
-                        fill_color="rgba(0,0,0,0)",
-                        stroke_width=brush_size,
-                        stroke_color=stroke_color,
-                        background_image=canvas_bg,
-                        update_streamlit=False,
-                        height=preview_bgr.shape[0],
-                        width=preview_bgr.shape[1],
-                        drawing_mode="freedraw",
-                        key=f"mask_editor_canvas_{st.session_state.canvas_key_counter}",
-                    )
-                with ref_col:
-                    st.caption("目前遮罩（編輯前，供對照參考）")
-                    st.image(bgr_to_rgb_for_display(reference_mask_blend), use_container_width=True)
-
-                recalc_col, finish_col = st.columns(2)
-                with recalc_col:
-                    if st.button("🔄 重新計算（套用目前筆刷）", use_container_width=True):
-                        image_data = get_canvas_image_data(canvas_result)
-                        if image_data is not None:
-                            st.session_state.current_mask = apply_canvas_strokes_to_mask(
-                                st.session_state.current_mask, image_data
-                            )
-                            st.session_state.canvas_key_counter += 1  # 清空畫布，避免重複套用
-                        st.rerun()
-                with finish_col:
-                    if st.button("✅ 完成編輯", type="primary", use_container_width=True):
-                        image_data = get_canvas_image_data(canvas_result)
-                        if image_data is not None:
-                            st.session_state.current_mask = apply_canvas_strokes_to_mask(
-                                st.session_state.current_mask, image_data
-                            )
-                        final_computed = recompute_full_result(
-                            st.session_state.current_mask,
-                            st.session_state.current_pixels_per_cm,
-                            st.session_state.height_threshold_cm,
-                        )
-                        lr = st.session_state.last_result
-                        lr["AI辨識綠化面積(m2)"] = round(final_computed["area_m2"], 4) if final_computed["area_m2"] is not None else None
-                        lr["左區高度(cm)"] = final_computed["zone_heights_cm"].get("left")
-                        lr["中區高度(cm)"] = final_computed["zone_heights_cm"].get("mid")
-                        lr["右區高度(cm)"] = final_computed["zone_heights_cm"].get("right")
-                        lr["高低型態判定"] = final_computed["shape_label"]
-                        st.session_state.last_result = lr
-                        st.session_state.editing_mode = False
-                        st.session_state.canvas_key_counter += 1
-                        st.success("已完成編輯，最終結果已更新，可以儲存了。")
-                        st.rerun()
+            mask_editor_dialog()
 
         # ---------------- 儲存按鈕（編輯中時隱藏，避免存到編輯前的舊資料） ----------------
         if not st.session_state.editing_mode:
@@ -893,6 +992,44 @@ def main():
     st.divider()
     st.header("🗄️ 多點位資料庫")
     st.caption(f"資料自動存於本機檔案：{DATA_FILE_PATH}")
+
+    st.subheader("📦 完整備份與還原（含照片，可跨電腦使用）")
+    st.caption(
+        "匯出會把「所有已儲存的資料」與「所有現場照片」打包成一個 ZIP 檔案。"
+        "只要有這個 ZIP 檔，不管在哪一台電腦（Windows／MacBook／雲端版）都能匯入還原成一樣的狀態，"
+        "很適合當作正式備份，或是把資料從一台電腦搬到另一台。"
+    )
+    backup_col1, backup_col2 = st.columns(2)
+    with backup_col1:
+        st.markdown("**⬇️ 匯出備份**")
+        backup_zip_bytes = build_full_backup_zip(st.session_state.dataframe)
+        st.download_button(
+            "📦 匯出完整備份（ZIP，含照片）",
+            data=backup_zip_bytes,
+            file_name=f"street_greening_full_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+    with backup_col2:
+        st.markdown("**⬆️ 匯入還原**")
+        uploaded_backup = st.file_uploader("選擇備份 ZIP 檔案", type=["zip"], key="backup_zip_uploader")
+        restore_mode_label = st.radio(
+            "還原方式",
+            ["取代目前所有資料", "合併（附加到目前資料後面）"],
+            horizontal=True,
+            key="restore_mode",
+        )
+        restore_mode = "replace" if restore_mode_label.startswith("取代") else "merge"
+        if restore_mode == "replace":
+            st.caption("⚠️ 這會清空目前畫面上的資料庫，改成備份檔裡的內容，請確認後再按下方按鈕。")
+        if uploaded_backup is not None:
+            if st.button("🔁 還原此備份", type="primary", use_container_width=True):
+                success, message = restore_from_backup_zip(uploaded_backup.getvalue(), mode=restore_mode)
+                if success:
+                    st.success(message)
+                    st.rerun()
+                else:
+                    st.error(message)
 
     reload_col, _ = st.columns([1, 4])
     with reload_col:
