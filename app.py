@@ -440,6 +440,21 @@ def resize_for_canvas(image_bgr, max_width=CANVAS_MAX_WIDTH):
     return resized
 
 
+def get_canvas_image_data(canvas_result):
+    """
+    安全取出 st_canvas 回傳物件的 image_data。
+    streamlit-drawable-canvas 在元件尚未完成第一次資料回傳時，存取
+    .image_data 會直接丟出 RuntimeError（而不是回傳 None），
+    這裡統一攔截，讓呼叫端可以簡單地把它當成「還沒有筆刷資料」處理。
+    """
+    if canvas_result is None:
+        return None
+    try:
+        return canvas_result.image_data
+    except RuntimeError:
+        return None
+
+
 def apply_canvas_strokes_to_mask(mask, canvas_image_data):
     """
     將畫布上的筆刷筆跡（RGBA，小尺寸）套用回原始尺寸的遮罩：
@@ -781,37 +796,54 @@ def main():
                 )
                 brush_mode = st.radio("筆刷模式", ["新增（綠色）", "移除（紅色）"], horizontal=True)
                 brush_size = st.slider("筆刷大小", 5, 60, 20)
-                stroke_color = "#00FF00" if brush_mode.startswith("新增") else "#FF0000"
+                # 筆刷透明度固定 50%，塗抹時才能同時看到底圖與畫到的範圍
+                stroke_color = "rgba(0, 255, 0, 0.5)" if brush_mode.startswith("新增") else "rgba(255, 0, 0, 0.5)"
 
                 preview_bgr = resize_for_canvas(st.session_state.current_image_bgr)
-                canvas_bg = Image.fromarray(bgr_to_rgb_for_display(preview_bgr))
-
-                canvas_result = st_canvas(
-                    fill_color="rgba(0,0,0,0)",
-                    stroke_width=brush_size,
-                    stroke_color=stroke_color,
-                    background_image=canvas_bg,
-                    update_streamlit=True,
-                    height=preview_bgr.shape[0],
-                    width=preview_bgr.shape[1],
-                    drawing_mode="freedraw",
-                    key=f"mask_editor_canvas_{st.session_state.canvas_key_counter}",
+                reference_mask_blend = preview_bgr.copy()
+                preview_mask = cv2.resize(
+                    st.session_state.current_mask,
+                    (preview_bgr.shape[1], preview_bgr.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
                 )
+                reference_mask_blend[preview_mask > 0] = (0, 255, 0)
+                reference_mask_blend = cv2.addWeighted(preview_bgr, 0.5, reference_mask_blend, 0.5, 0)
+
+                canvas_col, ref_col = st.columns([2, 1])
+                with canvas_col:
+                    st.caption("在這裡塗抹（綠色筆刷＝新增，紅色筆刷＝移除）")
+                    canvas_bg = Image.fromarray(bgr_to_rgb_for_display(preview_bgr))
+                    canvas_result = st_canvas(
+                        fill_color="rgba(0,0,0,0)",
+                        stroke_width=brush_size,
+                        stroke_color=stroke_color,
+                        background_image=canvas_bg,
+                        update_streamlit=False,
+                        height=preview_bgr.shape[0],
+                        width=preview_bgr.shape[1],
+                        drawing_mode="freedraw",
+                        key=f"mask_editor_canvas_{st.session_state.canvas_key_counter}",
+                    )
+                with ref_col:
+                    st.caption("目前遮罩（編輯前，供對照參考）")
+                    st.image(bgr_to_rgb_for_display(reference_mask_blend), use_container_width=True)
 
                 recalc_col, finish_col = st.columns(2)
                 with recalc_col:
                     if st.button("🔄 重新計算（套用目前筆刷）", use_container_width=True):
-                        if canvas_result is not None and canvas_result.image_data is not None:
+                        image_data = get_canvas_image_data(canvas_result)
+                        if image_data is not None:
                             st.session_state.current_mask = apply_canvas_strokes_to_mask(
-                                st.session_state.current_mask, canvas_result.image_data
+                                st.session_state.current_mask, image_data
                             )
                             st.session_state.canvas_key_counter += 1  # 清空畫布，避免重複套用
                         st.rerun()
                 with finish_col:
                     if st.button("✅ 完成編輯", type="primary", use_container_width=True):
-                        if canvas_result is not None and canvas_result.image_data is not None:
+                        image_data = get_canvas_image_data(canvas_result)
+                        if image_data is not None:
                             st.session_state.current_mask = apply_canvas_strokes_to_mask(
-                                st.session_state.current_mask, canvas_result.image_data
+                                st.session_state.current_mask, image_data
                             )
                         final_computed = recompute_full_result(
                             st.session_state.current_mask,
