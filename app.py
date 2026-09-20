@@ -26,6 +26,7 @@ Streamlit + OpenCV 電腦視覺應用程式
 """
 
 import io
+import re
 import os
 import zipfile
 import uuid
@@ -142,6 +143,17 @@ CANVAS_MAX_WIDTH = 1575  # 遮罩編輯預覽圖的最大寬度（像素）
 # ----------------------------------------------------------------------------
 # 本機資料存取（CSV，使用相對於程式檔案的路徑，Windows / Mac 皆可直接使用）
 # ----------------------------------------------------------------------------
+def natural_sort_key(value):
+    """
+    「自然排序」用的 key：把字串拆成文字／數字交錯的片段，數字片段轉成 int 比大小，
+    這樣「2」會排在「10」前面，而不是照文字順序變成 1、10、2。
+    對於「A2」「A10」這種文字＋數字混合的編號也適用。
+    """
+    s = "" if value is None else str(value)
+    parts = re.split(r"(\d+)", s)
+    return tuple(int(p) if p.isdigit() else p.lower() for p in parts)
+
+
 def load_local_data():
     if os.path.exists(DATA_FILE_PATH):
         try:
@@ -1249,7 +1261,7 @@ def main():
         pending_display_df = pd.DataFrame(
             [{k: v for k, v in r.items() if k != "_pending_id"} for r in st.session_state.pending_records]
         )
-        st.dataframe(pending_display_df, use_container_width=True)
+        st.dataframe(pending_display_df, use_container_width=True, hide_index=True)
 
         st.markdown("**📸 批次上傳照片（依照片中的 ArUco 編號自動比對清單中的資料）**")
         st.caption(
@@ -1510,7 +1522,7 @@ def main():
         with q_col1:
             selected_station = st.selectbox("篩選捷運站", station_options, key="station_filter")
         with q_col2:
-            sort_field = st.selectbox("排序依據", ["紀錄時間", "捷運站", "點位編號"])
+            sort_field = st.selectbox("排序依據", ["點位編號", "紀錄時間", "捷運站"])
         with q_col3:
             sort_order = st.radio("排序方式", ["新到舊／Z→A", "舊到新／A→Z"], horizontal=True)
 
@@ -1519,12 +1531,29 @@ def main():
 
         ascending = sort_order.startswith("舊到新")
         try:
-            df_view = df_view.sort_values(by=sort_field, ascending=ascending)
+            if sort_field == "點位編號":
+                # 點位編號用「自然排序」（依阿拉伯數字大小，而不是逐字元比對文字），
+                # 所以 2 會排在 10 前面，不會是文字順序的 1、10、2。
+                # 篩選捷運站選「全部」時，先依捷運站分組聚在一起，同一站內再依點位編號排序。
+                sort_columns = ["捷運站", "點位編號"] if selected_station == "全部" else ["點位編號"]
+
+                def _sort_key(col):
+                    if col.name == "點位編號":
+                        return col.map(natural_sort_key)
+                    return col
+
+                df_view = df_view.sort_values(by=sort_columns, key=_sort_key, ascending=ascending)
+            else:
+                df_view = df_view.sort_values(by=sort_field, ascending=ascending)
         except Exception:
             pass
 
         st.caption(f"目前顯示：{selected_station}，共 {len(df_view)} 筆")
-        st.dataframe(df_view.drop(columns=["紀錄日期"]), use_container_width=True)
+        st.dataframe(
+            df_view.drop(columns=["紀錄日期", "ArUco編號"], errors="ignore"),
+            use_container_width=True,
+            hide_index=True,
+        )
 
         st.subheader("📌 查看單一點位詳細內容")
         if not df_view.empty:
@@ -1738,6 +1767,7 @@ def main():
             df,
             use_container_width=True,
             num_rows="dynamic",
+            hide_index=True,
             key="db_editor",
         )
 
