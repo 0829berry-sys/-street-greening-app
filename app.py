@@ -43,6 +43,12 @@ from PIL import Image
 DIALOG_DECORATOR = getattr(st, "dialog", None) or getattr(st, "experimental_dialog", None)
 DIALOG_SUPPORTED = DIALOG_DECORATOR is not None
 
+try:
+    from streamlit_image_coordinates import streamlit_image_coordinates
+    IMAGE_COORDS_AVAILABLE = True
+except ImportError:
+    IMAGE_COORDS_AVAILABLE = False
+
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 # ----------------------------------------------------------------------------
@@ -269,6 +275,12 @@ def init_session_state():
         st.session_state.canvas_key_counter = 0
     if "mask_before_editing" not in st.session_state:
         st.session_state.mask_before_editing = None
+    if "rect_first_corner" not in st.session_state:
+        st.session_state.rect_first_corner = None
+    if "rect_second_corner" not in st.session_state:
+        st.session_state.rect_second_corner = None
+    if "last_click_coords" not in st.session_state:
+        st.session_state.last_click_coords = None
     if "height_threshold_cm" not in st.session_state:
         st.session_state.height_threshold_cm = HEIGHT_LEVEL_THRESHOLD_DEFAULT
     if "pending_records" not in st.session_state:
@@ -693,14 +705,125 @@ def render_result_visuals(image_bgr, mask, computed):
 # ----------------------------------------------------------------------------
 # 筆刷編輯視窗（彈出對話框；直接對「遮罩」本身進行編輯）
 # ----------------------------------------------------------------------------
-def _render_mask_editor_body():
+def _render_finish_revert_cancel_buttons():
+    """三個編輯階段共用的收尾按鈕：復原本次編輯／完成編輯／放棄並關閉。"""
+    revert_col, finish_col, cancel_col = st.columns(3)
+    with revert_col:
+        if st.button("↩️ 復原本次所有編輯", use_container_width=True):
+            st.session_state.current_mask = st.session_state.mask_before_editing.copy()
+            st.session_state.rect_first_corner = None
+            st.session_state.rect_second_corner = None
+            st.rerun()
+    with finish_col:
+        if st.button("✅ 完成編輯", type="primary", use_container_width=True):
+            final_computed = recompute_full_result(
+                st.session_state.current_mask,
+                st.session_state.current_pixels_per_cm,
+                st.session_state.height_threshold_cm,
+            )
+            lr = st.session_state.last_result
+            lr["AI辨識綠化面積(m2)"] = round(final_computed["area_m2"], 4) if final_computed["area_m2"] is not None else None
+            lr["左區高度(cm)"] = final_computed["zone_heights_cm"].get("left")
+            lr["中區高度(cm)"] = final_computed["zone_heights_cm"].get("mid")
+            lr["右區高度(cm)"] = final_computed["zone_heights_cm"].get("right")
+            lr["高低型態判定"] = final_computed["shape_label"]
+            st.session_state.last_result = lr
+            st.session_state.editing_mode = False
+            st.session_state.rect_first_corner = None
+            st.session_state.rect_second_corner = None
+            st.rerun()
+    with cancel_col:
+        if st.button("❌ 放棄本次編輯並關閉", use_container_width=True):
+            st.session_state.current_mask = st.session_state.mask_before_editing.copy()
+            st.session_state.editing_mode = False
+            st.session_state.rect_first_corner = None
+            st.session_state.rect_second_corner = None
+            st.rerun()
+
+
+def _render_mask_editor_click():
+    """滑鼠點兩下框選矩形（主要方式，需要 streamlit-image-coordinates 套件）。"""
     st.info(
-        "🖌️ 用下面的滑桿框出一個矩形區域，選擇要「新增」還是「移除」，按「套用」即可疊加到遮罩上；"
-        "可以連續套用多個矩形來組合出想要的形狀。這個工具不依賴容易失效的瀏覽器筆刷元件，"
-        "套用後會立即反映在下方的預覽圖與最終結果上。"
+        "🖱️ 在下方照片上**點一下**設定矩形的一個角，**再點一下**設定對角，就會框出矩形。"
+        "選擇要「新增」還是「移除」，按「➕ 套用這個矩形」即可疊加到遮罩上；"
+        "可以連續點選、套用多個矩形來組合出想要的形狀。"
     )
 
-    # 縮小版的照片＋目前遮罩疊圖，作為預覽與座標基準
+    mode = st.radio("這個矩形要做什麼", ["新增到綠化面積（綠框）", "從綠化面積移除（紅框）"], horizontal=True, key="rect_mode")
+
+    overlay = st.session_state.current_image_bgr.copy()
+    overlay[st.session_state.current_mask > 0] = (0, 255, 0)
+    blend = cv2.addWeighted(st.session_state.current_image_bgr, 0.5, overlay, 0.5, 0)
+    preview_base = resize_for_canvas(blend, max_width=CANVAS_MAX_WIDTH)
+    disp_h, disp_w = preview_base.shape[:2]
+    orig_h, orig_w = st.session_state.current_mask.shape[:2]
+    scale_x = orig_w / disp_w
+    scale_y = orig_h / disp_h
+
+    rect_color = (0, 255, 0) if mode.startswith("新增") else (0, 0, 255)
+    first_corner = st.session_state.get("rect_first_corner")
+    second_corner = st.session_state.get("rect_second_corner")
+
+    preview = preview_base.copy()
+    if first_corner is not None:
+        cv2.drawMarker(preview, first_corner, (255, 255, 0), markerType=cv2.MARKER_CROSS, markerSize=24, thickness=3)
+    if first_corner is not None and second_corner is not None:
+        rx0, rx1 = sorted([first_corner[0], second_corner[0]])
+        ry0, ry1 = sorted([first_corner[1], second_corner[1]])
+        cv2.rectangle(preview, (rx0, ry0), (rx1, ry1), rect_color, 3)
+
+    pil_preview = Image.fromarray(bgr_to_rgb_for_display(preview))
+    coords = streamlit_image_coordinates(pil_preview, key=f"mask_click_{st.session_state.canvas_key_counter}")
+
+    if coords is not None:
+        current_click = (int(coords["x"]), int(coords["y"]))
+        if current_click != st.session_state.get("last_click_coords"):
+            st.session_state.last_click_coords = current_click
+            if first_corner is None or second_corner is not None:
+                # 還沒開始選，或上一個矩形已經選滿了 → 開始一個新的矩形
+                st.session_state.rect_first_corner = current_click
+                st.session_state.rect_second_corner = None
+            else:
+                st.session_state.rect_second_corner = current_click
+            st.rerun()
+
+    if first_corner is not None and second_corner is not None:
+        rx0, rx1 = sorted([first_corner[0], second_corner[0]])
+        ry0, ry1 = sorted([first_corner[1], second_corner[1]])
+        apply_col, reset_col = st.columns(2)
+        with apply_col:
+            if st.button("➕ 套用這個矩形", type="primary", use_container_width=True):
+                x0, x1 = int(rx0 * scale_x), int(rx1 * scale_x)
+                y0, y1 = int(ry0 * scale_y), int(ry1 * scale_y)
+                new_mask = st.session_state.current_mask.copy()
+                if mode.startswith("新增"):
+                    new_mask[y0:y1, x0:x1] = 255
+                else:
+                    new_mask[y0:y1, x0:x1] = 0
+                st.session_state.current_mask = new_mask
+                st.session_state.rect_first_corner = None
+                st.session_state.rect_second_corner = None
+                st.session_state.canvas_key_counter += 1
+                st.rerun()
+        with reset_col:
+            if st.button("🔄 重新選取矩形", use_container_width=True):
+                st.session_state.rect_first_corner = None
+                st.session_state.rect_second_corner = None
+                st.rerun()
+    elif first_corner is not None:
+        st.caption("已設定第一個角，請在照片上點第二下設定對角。")
+
+    st.divider()
+    _render_finish_revert_cancel_buttons()
+
+
+def _render_mask_editor_sliders():
+    """滑桿框選矩形（備用方式：滑鼠點選套件不可用時自動改用這個）。"""
+    st.info(
+        "🖌️ 用下面的滑桿框出一個矩形區域，選擇要「新增」還是「移除」，按「套用」即可疊加到遮罩上；"
+        "可以連續套用多個矩形來組合出想要的形狀。"
+    )
+
     overlay = st.session_state.current_image_bgr.copy()
     overlay[st.session_state.current_mask > 0] = (0, 255, 0)
     blend = cv2.addWeighted(st.session_state.current_image_bgr, 0.5, overlay, 0.5, 0)
@@ -732,43 +855,30 @@ def _render_mask_editor_body():
         use_container_width=True,
     )
 
-    apply_col, revert_col, finish_col, cancel_col = st.columns(4)
-    with apply_col:
-        if st.button("➕ 套用這個矩形", type="primary", use_container_width=True):
-            x0, x1 = int(rect_x * scale_x), int(rect_x2 * scale_x)
-            y0, y1 = int(rect_y * scale_y), int(rect_y2 * scale_y)
-            new_mask = st.session_state.current_mask.copy()
-            if mode.startswith("新增"):
-                new_mask[y0:y1, x0:x1] = 255
-            else:
-                new_mask[y0:y1, x0:x1] = 0
-            st.session_state.current_mask = new_mask
-            st.rerun()
-    with revert_col:
-        if st.button("↩️ 復原本次所有編輯", use_container_width=True):
-            st.session_state.current_mask = st.session_state.mask_before_editing.copy()
-            st.rerun()
-    with finish_col:
-        if st.button("✅ 完成編輯", type="primary", use_container_width=True):
-            final_computed = recompute_full_result(
-                st.session_state.current_mask,
-                st.session_state.current_pixels_per_cm,
-                st.session_state.height_threshold_cm,
-            )
-            lr = st.session_state.last_result
-            lr["AI辨識綠化面積(m2)"] = round(final_computed["area_m2"], 4) if final_computed["area_m2"] is not None else None
-            lr["左區高度(cm)"] = final_computed["zone_heights_cm"].get("left")
-            lr["中區高度(cm)"] = final_computed["zone_heights_cm"].get("mid")
-            lr["右區高度(cm)"] = final_computed["zone_heights_cm"].get("right")
-            lr["高低型態判定"] = final_computed["shape_label"]
-            st.session_state.last_result = lr
-            st.session_state.editing_mode = False
-            st.rerun()
-    with cancel_col:
-        if st.button("❌ 放棄本次編輯並關閉", use_container_width=True):
-            st.session_state.current_mask = st.session_state.mask_before_editing.copy()
-            st.session_state.editing_mode = False
-            st.rerun()
+    if st.button("➕ 套用這個矩形", type="primary", use_container_width=True):
+        x0, x1 = int(rect_x * scale_x), int(rect_x2 * scale_x)
+        y0, y1 = int(rect_y * scale_y), int(rect_y2 * scale_y)
+        new_mask = st.session_state.current_mask.copy()
+        if mode.startswith("新增"):
+            new_mask[y0:y1, x0:x1] = 255
+        else:
+            new_mask[y0:y1, x0:x1] = 0
+        st.session_state.current_mask = new_mask
+        st.rerun()
+
+    st.divider()
+    _render_finish_revert_cancel_buttons()
+
+
+def _render_mask_editor_body():
+    if IMAGE_COORDS_AVAILABLE:
+        _render_mask_editor_click()
+    else:
+        st.warning(
+            "尚未安裝滑鼠圈選所需套件，暫時使用滑桿版本。"
+            "如果想改用滑鼠點選，請於終端機執行：pip install streamlit-image-coordinates 後重新啟動程式。"
+        )
+        _render_mask_editor_sliders()
 
 
 if DIALOG_SUPPORTED:
@@ -811,7 +921,9 @@ def render_active_result_panel():
         if not st.session_state.editing_mode:
             if st.button("✏️ 編輯遮罩", use_container_width=True, key="edit_mask_btn"):
                 st.session_state.mask_before_editing = st.session_state.current_mask.copy()
-                st.session_state.last_canvas_data_hash = None
+                st.session_state.rect_first_corner = None
+                st.session_state.rect_second_corner = None
+                st.session_state.last_click_coords = None
                 st.session_state.editing_mode = True
                 st.rerun()
         else:
