@@ -394,14 +394,24 @@ def detect_first_aruco_geometry(image_bgr):
     return None, None
 
 
-def compute_default_roi_box(image_shape, marker_corners=None, marker_center=None, multiplier=6.0):
+def compute_default_roi_box(image_shape, marker_corners=None, marker_center=None, multiplier=6.0,
+                             image_bgr=None, use_plant_detection=False):
     """
-    估算「盆栽大概在哪個範圍」的預設框：
-    - 有偵測到 ArUco 時，以標記中心為基準，往外延伸 marker 邊長 × multiplier 倍的正方形範圍。
-    - 沒有偵測到 ArUco 時，退回照片正中央 60% 的範圍當預設值。
-    這只是「合理的猜測」，不是真正辨識盆栽；回傳 (x0, y0, x1, y1) 像素座標（已裁切在圖片範圍內）。
+    估算「盆栽大概在哪個範圍」的預設框，依序嘗試：
+    1.（use_plant_detection 開啟且有提供 image_bgr 時）用 YOLOv8 實際偵測盆栽物件的位置；
+       畫面中有多個盆栽時，優先選離 ArUco 標記最近的一個。偵測失敗、套件沒裝、或沒找到
+       盆栽，都會自動退回下面的方式，不會中斷。
+    2. 有偵測到 ArUco 時，以標記中心為基準，往外延伸 marker 邊長 × multiplier 倍的正方形範圍。
+    3. 都沒有的話，退回照片正中央 60% 的範圍當預設值。
+    回傳 (x0, y0, x1, y1) 像素座標（已裁切在圖片範圍內）。
     """
     h, w = image_shape[:2]
+
+    if use_plant_detection and image_bgr is not None:
+        roi_yolo, _boxes, _msg = detect_potted_plant_roi(image_bgr, marker_center=marker_center)
+        if roi_yolo is not None:
+            return roi_yolo
+
     if marker_corners is not None and marker_center is not None:
         side_lengths_px = [
             float(np.linalg.norm(marker_corners[i] - marker_corners[(i + 1) % 4]))
@@ -438,10 +448,11 @@ def apply_roi_to_mask(mask, roi):
     return restricted
 
 
-def render_roi_box_selector(image_bgr, key_prefix, roi_multiplier, max_preview_width=320):
+def render_roi_box_selector(image_bgr, key_prefix, roi_multiplier, max_preview_width=320, use_plant_detection=False):
     """
     顯示一個小預覽圖＋兩條範圍滑桿，讓使用者框選「盆栽大概在哪個範圍」，
-    預設框會先用 ArUco 標記位置自動推算，使用者可以再用滑桿微調。
+    預設框會先嘗試用 YOLOv8 偵測盆栽（若開啟），否則用 ArUco 標記位置自動推算，
+    使用者可以再用滑桿微調。
     回傳 (x0, y0, x1, y1)：原始照片解析度下的像素座標。
     """
     preview = resize_for_canvas(image_bgr, max_width=max_preview_width)
@@ -452,7 +463,8 @@ def render_roi_box_selector(image_bgr, key_prefix, roi_multiplier, max_preview_w
 
     marker_corners, marker_center = detect_first_aruco_geometry(image_bgr)
     default_x0, default_y0, default_x1, default_y1 = compute_default_roi_box(
-        image_bgr.shape, marker_corners, marker_center, multiplier=roi_multiplier
+        image_bgr.shape, marker_corners, marker_center, multiplier=roi_multiplier,
+        image_bgr=image_bgr, use_plant_detection=use_plant_detection,
     )
     # 換算成縮圖座標，當作滑桿的預設值
     default_disp_x = (int(default_x0 / scale_x), int(default_x1 / scale_x))
@@ -577,6 +589,75 @@ def clean_mask(mask, kernel_size=5):
     mask_clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel)
     return mask_clean
+
+
+# ----------------------------------------------------------------------------
+# 盆栽物件偵測（YOLOv8，用來讓「範圍推算」更準，取代單純用 ArUco 位置猜測）
+# 這是選用功能：套件裝不起來、模型下載失敗、或執行時出錯，都會自動退回
+# 原本「用 ArUco 位置推算」的方式，不會讓程式整個掛掉。
+# ----------------------------------------------------------------------------
+@st.cache_resource(show_spinner="首次使用需下載盆栽偵測模型，請稍候…")
+def load_plant_detection_model():
+    try:
+        from ultralytics import YOLO
+        return YOLO("yolov8n.pt")
+    except Exception:
+        return None
+
+
+def detect_potted_plant_roi(image_bgr, marker_center=None, conf_threshold=0.25, padding_ratio=0.15):
+    """
+    用 YOLOv8 預訓練模型（COCO 的 "potted plant" 類別）偵測照片中的盆栽，
+    回傳 (roi, all_boxes, message)：
+        roi：(x0, y0, x1, y1) 選定的分析範圍（已加上邊界留白），偵測失敗時為 None
+        all_boxes：偵測到的所有盆栽框（含信心值），供除錯/顯示用
+        message：給使用者看的狀態說明文字
+    若畫面中有多個盆栽，優先選離 ArUco 標記最近的一個（標記本來就貼在該點位盆栽最外側）；
+    沒有標記位置資訊的話，改選面積最大的框。
+    """
+    model = load_plant_detection_model()
+    if model is None:
+        return None, [], "盆栽偵測模型尚未安裝或載入失敗"
+
+    try:
+        results = model.predict(image_bgr, verbose=False, conf=conf_threshold)
+    except Exception as e:
+        return None, [], f"盆栽偵測執行失敗（{e}）"
+
+    boxes = []
+    for r in results:
+        for box in r.boxes:
+            cls_id = int(box.cls[0])
+            cls_name = model.names.get(cls_id, "")
+            if cls_name == "potted plant":
+                xyxy = box.xyxy[0].tolist()
+                conf = float(box.conf[0])
+                boxes.append((xyxy[0], xyxy[1], xyxy[2], xyxy[3], conf))
+
+    if not boxes:
+        return None, [], "這張照片沒有偵測到盆栽"
+
+    if marker_center is not None:
+        mx, my = marker_center
+
+        def _dist(b):
+            cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+            return (cx - mx) ** 2 + (cy - my) ** 2
+
+        chosen = min(boxes, key=_dist)
+    else:
+        chosen = max(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+
+    x0, y0, x1, y1, conf = chosen
+    h, w = image_bgr.shape[:2]
+    bw, bh = x1 - x0, y1 - y0
+    x0 = max(0, x0 - bw * padding_ratio)
+    y0 = max(0, y0 - bh * padding_ratio)
+    x1 = min(w, x1 + bw * padding_ratio)
+    y1 = min(h, y1 + bh * padding_ratio)
+    roi = (int(x0), int(y0), int(x1), int(y1))
+    message = f"✅ 已用 YOLOv8 偵測到盆栽（信心值 {conf:.2f}）"
+    return roi, boxes, message
 
 
 def compute_green_area_m2(mask, pixels_per_cm):
@@ -1239,19 +1320,30 @@ def main():
             "啟用範圍限制（只分析框選/推算範圍內的綠色，範圍外一律忽略）",
             value=False,
             help="開啟後，單筆分析與批次逐筆分析時可以用滑桿手動框選盆栽大概的範圍；"
-                 "批次自動比對照片時沒辦法一張張手動框，會直接用 ArUco 標記位置自動推算範圍。",
+                 "批次自動比對照片時沒辦法一張張手動框，會直接用下面選的方式自動推算範圍。",
         )
+        use_plant_detection = False
+        if roi_restriction_enabled:
+            use_plant_detection = st.checkbox(
+                "🔍 用 YOLOv8 自動偵測盆栽位置（比較準，但需要額外套件）",
+                value=False,
+                help="開啟後，會先嘗試用物件偵測模型實際找出照片中的盆栽位置來當作預設範圍；"
+                     "如果套件沒裝好、模型載入失敗、或這張照片沒偵測到盆栽，"
+                     "會自動退回下面「用 ArUco 位置推算」的方式，不會中斷分析。"
+                     "畫面中有多個盆栽時，會優先選離 ArUco 標記最近的那一個。",
+            )
         roi_multiplier = st.slider(
             "自動推算範圍的倍數（以 ArUco 邊長為單位）", 2.0, 15.0, 6.0, step=0.5,
-            help="沒有手動框選、或批次自動比對照片時，會以 ArUco 標記為中心，"
+            help="當 YOLOv8 沒有開啟、或沒有偵測到盆栽時，會以 ArUco 標記為中心，"
                  "往外延伸「標記邊長 × 這個倍數」的範圍當作預設的分析範圍。倍數越大，涵蓋的範圍越大。",
         )
 
         single_entry_roi = None
         if roi_restriction_enabled and uploaded_file is not None and preview_bgr is not None:
-            st.caption("在下方微調盆栽範圍（已用 ArUco 位置預先抓好一個建議框，可以直接用滑桿調整）")
+            st.caption("在下方微調盆栽範圍（已自動抓好一個建議框，可以直接用滑桿調整）")
             single_entry_roi = render_roi_box_selector(
-                preview_bgr, "single_entry_roi", roi_multiplier, max_preview_width=300
+                preview_bgr, "single_entry_roi", roi_multiplier, max_preview_width=300,
+                use_plant_detection=use_plant_detection,
             )
 
         st.divider()
@@ -1301,7 +1393,8 @@ def main():
                     # 沒有手動框選（例如關掉範圍限制後又打開、還沒重新跑出滑桿）時，退回自動推算的範圍
                     marker_corners_r, marker_center_r = detect_first_aruco_geometry(image_bgr)
                     roi_to_apply = compute_default_roi_box(
-                        image_bgr.shape, marker_corners_r, marker_center_r, multiplier=roi_multiplier
+                        image_bgr.shape, marker_corners_r, marker_center_r, multiplier=roi_multiplier,
+                        image_bgr=image_bgr, use_plant_detection=use_plant_detection,
                     )
                 mask = apply_roi_to_mask(mask, roi_to_apply)
 
@@ -1462,7 +1555,8 @@ def main():
                         # 批次自動比對沒辦法一張張手動框選，直接用 ArUco 位置自動推算範圍
                         marker_corners_rb, marker_center_rb = detect_first_aruco_geometry(bulk_bgr)
                         roi_to_apply_b = compute_default_roi_box(
-                            bulk_bgr.shape, marker_corners_rb, marker_center_rb, multiplier=roi_multiplier
+                            bulk_bgr.shape, marker_corners_rb, marker_center_rb, multiplier=roi_multiplier,
+                            image_bgr=bulk_bgr, use_plant_detection=use_plant_detection,
                         )
                         mask_b = apply_roi_to_mask(mask_b, roi_to_apply_b)
 
@@ -1597,7 +1691,8 @@ def main():
                     if roi_to_apply_p is None:
                         marker_corners_rp, marker_center_rp = detect_first_aruco_geometry(pending_bgr)
                         roi_to_apply_p = compute_default_roi_box(
-                            pending_bgr.shape, marker_corners_rp, marker_center_rp, multiplier=roi_multiplier
+                            pending_bgr.shape, marker_corners_rp, marker_center_rp, multiplier=roi_multiplier,
+                            image_bgr=pending_bgr, use_plant_detection=use_plant_detection,
                         )
                     mask_p = apply_roi_to_mask(mask_p, roi_to_apply_p)
 
@@ -1798,7 +1893,8 @@ def main():
                                 if roi_restriction_enabled:
                                     marker_corners_rh, marker_center_rh = detect_first_aruco_geometry(loaded_bgr)
                                     roi_to_apply_h = compute_default_roi_box(
-                                        loaded_bgr.shape, marker_corners_rh, marker_center_rh, multiplier=roi_multiplier
+                                        loaded_bgr.shape, marker_corners_rh, marker_center_rh, multiplier=roi_multiplier,
+                                        image_bgr=loaded_bgr, use_plant_detection=use_plant_detection,
                                     )
                                     mask_h = apply_roi_to_mask(mask_h, roi_to_apply_h)
 
