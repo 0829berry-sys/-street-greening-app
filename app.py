@@ -946,6 +946,12 @@ def render_active_result_panel():
                     idx = st.session_state.active_history_edit_index
                     for k, v in st.session_state.last_result.items():
                         if k in st.session_state.dataframe.columns:
+                            # 資料表裡不是「數值欄位」的欄位存的是文字型別，直接塞 float/None 進去
+                            # 在新版 pandas 會丟型別錯誤，這裡統一轉成字串（空值轉成空字串）。
+                            if k not in NUMERIC_COLS_FOR_STATS and v is not None and not isinstance(v, str):
+                                v = str(v)
+                            elif k not in NUMERIC_COLS_FOR_STATS and v is None:
+                                v = ""
                             st.session_state.dataframe.at[idx, k] = v
                     save_local_data(st.session_state.dataframe)
                     st.session_state.active_history_edit_index = None
@@ -1620,7 +1626,7 @@ def main():
                         df_ss.at[record_index, "ArUco偵測ID"] = "、".join(str(i) for i in new_ids_found) if new_ids_found else ""
                         df_ss.at[record_index, "編號比對結果"] = match_status_new
                         df_ss.at[record_index, "比例尺來源"] = scale_source_new
-                        df_ss.at[record_index, "像素/公分比例尺"] = round(pxcm_new, 4) if pxcm_new else None
+                        df_ss.at[record_index, "像素/公分比例尺"] = str(round(pxcm_new, 4)) if pxcm_new else ""
                         df_ss.at[record_index, "AI辨識綠化面積(m2)"] = (
                             round(computed_new["area_m2"], 4) if computed_new["area_m2"] is not None else None
                         )
