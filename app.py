@@ -379,6 +379,105 @@ def detect_aruco_ids_only(image_bgr):
     return [], None
 
 
+def detect_first_aruco_geometry(image_bgr):
+    """回傳第一個偵測到的 ArUco marker 的四個角點與中心點（像素座標）；沒偵測到則回傳 (None, None)。"""
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    detector_params = cv2.aruco.DetectorParameters()
+    for dict_name, dict_id in ARUCO_DICT_CANDIDATES.items():
+        aruco_dict = cv2.aruco.getPredefinedDictionary(dict_id)
+        detector = cv2.aruco.ArucoDetector(aruco_dict, detector_params)
+        corners, ids, _rejected = detector.detectMarkers(gray)
+        if ids is not None and len(ids) > 0:
+            marker_corners = corners[0].reshape(4, 2)
+            center = marker_corners.mean(axis=0)
+            return marker_corners, center
+    return None, None
+
+
+def compute_default_roi_box(image_shape, marker_corners=None, marker_center=None, multiplier=6.0):
+    """
+    估算「盆栽大概在哪個範圍」的預設框：
+    - 有偵測到 ArUco 時，以標記中心為基準，往外延伸 marker 邊長 × multiplier 倍的正方形範圍。
+    - 沒有偵測到 ArUco 時，退回照片正中央 60% 的範圍當預設值。
+    這只是「合理的猜測」，不是真正辨識盆栽；回傳 (x0, y0, x1, y1) 像素座標（已裁切在圖片範圍內）。
+    """
+    h, w = image_shape[:2]
+    if marker_corners is not None and marker_center is not None:
+        side_lengths_px = [
+            float(np.linalg.norm(marker_corners[i] - marker_corners[(i + 1) % 4]))
+            for i in range(4)
+        ]
+        avg_side_px = float(np.mean(side_lengths_px))
+        half_extent = avg_side_px * multiplier / 2.0
+        cx, cy = float(marker_center[0]), float(marker_center[1])
+        x0, x1 = cx - half_extent, cx + half_extent
+        y0, y1 = cy - half_extent, cy + half_extent
+    else:
+        margin_x, margin_y = w * 0.2, h * 0.2
+        x0, x1 = margin_x, w - margin_x
+        y0, y1 = margin_y, h - margin_y
+
+    x0 = max(0, int(x0))
+    x1 = min(w, int(x1))
+    y0 = max(0, int(y0))
+    y1 = min(h, int(y1))
+    return (x0, y0, x1, y1)
+
+
+def apply_roi_to_mask(mask, roi):
+    """roi 為 (x0, y0, x1, y1) 像素座標（跟 mask 同一個尺寸），roi 為 None 時代表不限制範圍。"""
+    if roi is None:
+        return mask
+    x0, y0, x1, y1 = roi
+    h, w = mask.shape[:2]
+    x0c, x1c = max(0, min(x0, w)), max(0, min(x1, w))
+    y0c, y1c = max(0, min(y0, h)), max(0, min(y1, h))
+    restricted = np.zeros_like(mask)
+    if x1c > x0c and y1c > y0c:
+        restricted[y0c:y1c, x0c:x1c] = mask[y0c:y1c, x0c:x1c]
+    return restricted
+
+
+def render_roi_box_selector(image_bgr, key_prefix, roi_multiplier, max_preview_width=320):
+    """
+    顯示一個小預覽圖＋兩條範圍滑桿，讓使用者框選「盆栽大概在哪個範圍」，
+    預設框會先用 ArUco 標記位置自動推算，使用者可以再用滑桿微調。
+    回傳 (x0, y0, x1, y1)：原始照片解析度下的像素座標。
+    """
+    preview = resize_for_canvas(image_bgr, max_width=max_preview_width)
+    disp_h, disp_w = preview.shape[:2]
+    orig_h, orig_w = image_bgr.shape[:2]
+    scale_x = orig_w / disp_w
+    scale_y = orig_h / disp_h
+
+    marker_corners, marker_center = detect_first_aruco_geometry(image_bgr)
+    default_x0, default_y0, default_x1, default_y1 = compute_default_roi_box(
+        image_bgr.shape, marker_corners, marker_center, multiplier=roi_multiplier
+    )
+    # 換算成縮圖座標，當作滑桿的預設值
+    default_disp_x = (int(default_x0 / scale_x), int(default_x1 / scale_x))
+    default_disp_y = (int(default_y0 / scale_y), int(default_y1 / scale_y))
+
+    x_range = st.slider(
+        "水平範圍（左－右）", 0, disp_w, default_disp_x, key=f"{key_prefix}_roi_x"
+    )
+    y_range = st.slider(
+        "垂直範圍（上－下）", 0, disp_h, default_disp_y, key=f"{key_prefix}_roi_y"
+    )
+
+    preview_with_box = preview.copy()
+    cv2.rectangle(preview_with_box, (x_range[0], y_range[0]), (x_range[1], y_range[1]), (0, 255, 255), 3)
+    st.image(
+        bgr_to_rgb_for_display(preview_with_box),
+        caption="黃框＝分析範圍（框外的綠色都不會計入）",
+        use_container_width=True,
+    )
+
+    x0, x1 = int(x_range[0] * scale_x), int(x_range[1] * scale_x)
+    y0, y1 = int(y_range[0] * scale_y), int(y_range[1] * scale_y)
+    return (x0, y0, x1, y1)
+
+
 def build_aruco_match_message(point_id, ids_found):
     """依偵測到的 ArUco ID 清單與手動輸入之點位編號，組出比對結果文字。"""
     if not ids_found:
@@ -998,6 +1097,7 @@ def main():
             uploaded_file = st.file_uploader("上傳單張現場調查照片（JPG / PNG）", type=["jpg", "jpeg", "png"])
 
             ids_found = []
+            preview_bgr = None
             if uploaded_file is not None:
                 try:
                     preview_bytes = uploaded_file.getvalue()
@@ -1095,6 +1195,7 @@ def main():
             )
             uploaded_file = None
             ids_found = []
+            preview_bgr = None
             mrt_station = ""
             point_id = ""
             shooting_distance = 3.0
@@ -1131,6 +1232,27 @@ def main():
             "高低型態判定閾值（公分）", 1.0, 20.0, HEIGHT_LEVEL_THRESHOLD_DEFAULT, step=0.5,
             help="左/中/右三區高度要相差多少公分以上，才會被視為有明顯的「高、低」差異，藉此判斷擺放立面形式。",
         )
+
+        st.divider()
+        st.markdown("**🌿 盆栽範圍限制（排除背景街景干擾）**")
+        roi_restriction_enabled = st.checkbox(
+            "啟用範圍限制（只分析框選/推算範圍內的綠色，範圍外一律忽略）",
+            value=False,
+            help="開啟後，單筆分析與批次逐筆分析時可以用滑桿手動框選盆栽大概的範圍；"
+                 "批次自動比對照片時沒辦法一張張手動框，會直接用 ArUco 標記位置自動推算範圍。",
+        )
+        roi_multiplier = st.slider(
+            "自動推算範圍的倍數（以 ArUco 邊長為單位）", 2.0, 15.0, 6.0, step=0.5,
+            help="沒有手動框選、或批次自動比對照片時，會以 ArUco 標記為中心，"
+                 "往外延伸「標記邊長 × 這個倍數」的範圍當作預設的分析範圍。倍數越大，涵蓋的範圍越大。",
+        )
+
+        single_entry_roi = None
+        if roi_restriction_enabled and uploaded_file is not None and preview_bgr is not None:
+            st.caption("在下方微調盆栽範圍（已用 ArUco 位置預先抓好一個建議框，可以直接用滑桿調整）")
+            single_entry_roi = render_roi_box_selector(
+                preview_bgr, "single_entry_roi", roi_multiplier, max_preview_width=300
+            )
 
         st.divider()
         manual_scale_override = st.number_input(
@@ -1172,6 +1294,16 @@ def main():
                 raw_mask = extract_green_mask_exg(image_bgr, exg_threshold)
 
             mask = clean_mask(raw_mask, kernel_size=morph_kernel)
+
+            if roi_restriction_enabled:
+                roi_to_apply = single_entry_roi
+                if roi_to_apply is None:
+                    # 沒有手動框選（例如關掉範圍限制後又打開、還沒重新跑出滑桿）時，退回自動推算的範圍
+                    marker_corners_r, marker_center_r = detect_first_aruco_geometry(image_bgr)
+                    roi_to_apply = compute_default_roi_box(
+                        image_bgr.shape, marker_corners_r, marker_center_r, multiplier=roi_multiplier
+                    )
+                mask = apply_roi_to_mask(mask, roi_to_apply)
 
             match_msg, match_status = build_aruco_match_message(point_id, ids_found)
 
@@ -1325,6 +1457,15 @@ def main():
                     else:
                         raw_mask_b = extract_green_mask_exg(bulk_bgr, exg_threshold)
                     mask_b = clean_mask(raw_mask_b, kernel_size=morph_kernel)
+
+                    if roi_restriction_enabled:
+                        # 批次自動比對沒辦法一張張手動框選，直接用 ArUco 位置自動推算範圍
+                        marker_corners_rb, marker_center_rb = detect_first_aruco_geometry(bulk_bgr)
+                        roi_to_apply_b = compute_default_roi_box(
+                            bulk_bgr.shape, marker_corners_rb, marker_center_rb, multiplier=roi_multiplier
+                        )
+                        mask_b = apply_roi_to_mask(mask_b, roi_to_apply_b)
+
                     computed_b = recompute_full_result(mask_b, pxcm_b, height_threshold_cm)
                     match_msg_b, match_status_b = build_aruco_match_message(
                         matched_record.get("點位編號", ""), bulk_ids_found
@@ -1426,6 +1567,13 @@ def main():
             else:
                 st.warning("📷 未偵測到 ArUco 標記")
 
+            pending_roi = None
+            if roi_restriction_enabled:
+                st.caption("🌿 微調盆栽範圍（已用 ArUco 位置預先抓好一個建議框，可以直接用滑桿調整）")
+                pending_roi = render_roi_box_selector(
+                    pending_bgr, f"pending_roi_{selected_pending_id}", roi_multiplier, max_preview_width=420
+                )
+
             if st.button("🚀 對這筆資料執行分析", type="primary", key=f"analyze_pending_{selected_pending_id}"):
                 marker_len = float(selected_record.get("ArUco邊長(cm)", 20) or 20)
                 _annotated_p, pixels_per_cm_p, _c, dict_used_p, _mc, marker_id_p = detect_aruco_marker(pending_bgr, marker_len)
@@ -1443,6 +1591,15 @@ def main():
                 else:
                     raw_mask_p = extract_green_mask_exg(pending_bgr, exg_threshold)
                 mask_p = clean_mask(raw_mask_p, kernel_size=morph_kernel)
+
+                if roi_restriction_enabled:
+                    roi_to_apply_p = pending_roi
+                    if roi_to_apply_p is None:
+                        marker_corners_rp, marker_center_rp = detect_first_aruco_geometry(pending_bgr)
+                        roi_to_apply_p = compute_default_roi_box(
+                            pending_bgr.shape, marker_corners_rp, marker_center_rp, multiplier=roi_multiplier
+                        )
+                    mask_p = apply_roi_to_mask(mask_p, roi_to_apply_p)
 
                 computed_p = recompute_full_result(mask_p, pixels_per_cm_p, height_threshold_cm)
                 match_msg_p, match_status_p = build_aruco_match_message(selected_record.get("點位編號", ""), pending_ids_found)
@@ -1638,6 +1795,12 @@ def main():
                                 else:
                                     raw_mask_h = extract_green_mask_exg(loaded_bgr, exg_threshold)
                                 mask_h = clean_mask(raw_mask_h, kernel_size=morph_kernel)
+                                if roi_restriction_enabled:
+                                    marker_corners_rh, marker_center_rh = detect_first_aruco_geometry(loaded_bgr)
+                                    roi_to_apply_h = compute_default_roi_box(
+                                        loaded_bgr.shape, marker_corners_rh, marker_center_rh, multiplier=roi_multiplier
+                                    )
+                                    mask_h = apply_roi_to_mask(mask_h, roi_to_apply_h)
 
                             # 比例尺優先沿用這筆紀錄原本存的像素/公分比例尺；沒有的話才重新偵測 ArUco
                             stored_scale = None
