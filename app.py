@@ -12,6 +12,13 @@ Streamlit + OpenCV 電腦視覺應用程式
     streamlit run app.py
     （若出現 'streamlit' 無法辨識，改用：python -m streamlit run app.py）
 
+【v4 更新重點】
+    1. 移除側邊欄，所有功能都在主畫面（右側）操作；「影像分析參數設定」與「單筆輸入」
+       改為主畫面上可收合的區塊（expander）。
+    2. 主畫面排版順序調整為：標題 → 影像分析參數設定 → 單筆輸入 → 批次匯入點位屬性 →
+       歷史紀錄查詢（含查看單一點位詳細內容）→ 統計分析 → 多點位資料庫。
+    3. 功能與前一版相同，僅調整版面配置。
+
 【v3 更新重點】
     1. 側邊欄：照片上傳移到最上方，點位編號輸入後立即顯示 ArUco 比對結果；
        移除「盆栽主要類型」「盆栽擺放位置（相對位置）」；新增名詞說明區塊。
@@ -52,7 +59,6 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 st.set_page_config(
     page_title="街道非正式綠化（盆栽佔用）調查分析系統",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -357,8 +363,6 @@ def init_session_state():
         st.session_state.active_batch_pending_id = None
     if "active_history_edit_index" not in st.session_state:
         st.session_state.active_history_edit_index = None
-    if "show_manual_form" not in st.session_state:
-        st.session_state.show_manual_form = True
 
 
 # ----------------------------------------------------------------------------
@@ -377,117 +381,6 @@ def detect_aruco_ids_only(image_bgr):
             return [int(x) for x in ids.flatten()], dict_name
 
     return [], None
-
-
-def detect_first_aruco_geometry(image_bgr):
-    """回傳第一個偵測到的 ArUco marker 的四個角點與中心點（像素座標）；沒偵測到則回傳 (None, None)。"""
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    detector_params = cv2.aruco.DetectorParameters()
-    for dict_name, dict_id in ARUCO_DICT_CANDIDATES.items():
-        aruco_dict = cv2.aruco.getPredefinedDictionary(dict_id)
-        detector = cv2.aruco.ArucoDetector(aruco_dict, detector_params)
-        corners, ids, _rejected = detector.detectMarkers(gray)
-        if ids is not None and len(ids) > 0:
-            marker_corners = corners[0].reshape(4, 2)
-            center = marker_corners.mean(axis=0)
-            return marker_corners, center
-    return None, None
-
-
-def compute_default_roi_box(image_shape, marker_corners=None, marker_center=None, multiplier=6.0,
-                             image_bgr=None, use_plant_detection=False):
-    """
-    估算「盆栽大概在哪個範圍」的預設框，依序嘗試：
-    1.（use_plant_detection 開啟且有提供 image_bgr 時）用 YOLOv8 實際偵測盆栽物件的位置；
-       畫面中有多個盆栽時，優先選離 ArUco 標記最近的一個。偵測失敗、套件沒裝、或沒找到
-       盆栽，都會自動退回下面的方式，不會中斷。
-    2. 有偵測到 ArUco 時，以標記中心為基準，往外延伸 marker 邊長 × multiplier 倍的正方形範圍。
-    3. 都沒有的話，退回照片正中央 60% 的範圍當預設值。
-    回傳 (x0, y0, x1, y1) 像素座標（已裁切在圖片範圍內）。
-    """
-    h, w = image_shape[:2]
-
-    if use_plant_detection and image_bgr is not None:
-        roi_yolo, _boxes, _msg = detect_potted_plant_roi(image_bgr, marker_center=marker_center)
-        if roi_yolo is not None:
-            return roi_yolo
-
-    if marker_corners is not None and marker_center is not None:
-        side_lengths_px = [
-            float(np.linalg.norm(marker_corners[i] - marker_corners[(i + 1) % 4]))
-            for i in range(4)
-        ]
-        avg_side_px = float(np.mean(side_lengths_px))
-        half_extent = avg_side_px * multiplier / 2.0
-        cx, cy = float(marker_center[0]), float(marker_center[1])
-        x0, x1 = cx - half_extent, cx + half_extent
-        y0, y1 = cy - half_extent, cy + half_extent
-    else:
-        margin_x, margin_y = w * 0.2, h * 0.2
-        x0, x1 = margin_x, w - margin_x
-        y0, y1 = margin_y, h - margin_y
-
-    x0 = max(0, int(x0))
-    x1 = min(w, int(x1))
-    y0 = max(0, int(y0))
-    y1 = min(h, int(y1))
-    return (x0, y0, x1, y1)
-
-
-def apply_roi_to_mask(mask, roi):
-    """roi 為 (x0, y0, x1, y1) 像素座標（跟 mask 同一個尺寸），roi 為 None 時代表不限制範圍。"""
-    if roi is None:
-        return mask
-    x0, y0, x1, y1 = roi
-    h, w = mask.shape[:2]
-    x0c, x1c = max(0, min(x0, w)), max(0, min(x1, w))
-    y0c, y1c = max(0, min(y0, h)), max(0, min(y1, h))
-    restricted = np.zeros_like(mask)
-    if x1c > x0c and y1c > y0c:
-        restricted[y0c:y1c, x0c:x1c] = mask[y0c:y1c, x0c:x1c]
-    return restricted
-
-
-def render_roi_box_selector(image_bgr, key_prefix, roi_multiplier, max_preview_width=320, use_plant_detection=False):
-    """
-    顯示一個小預覽圖＋兩條範圍滑桿，讓使用者框選「盆栽大概在哪個範圍」，
-    預設框會先嘗試用 YOLOv8 偵測盆栽（若開啟），否則用 ArUco 標記位置自動推算，
-    使用者可以再用滑桿微調。
-    回傳 (x0, y0, x1, y1)：原始照片解析度下的像素座標。
-    """
-    preview = resize_for_canvas(image_bgr, max_width=max_preview_width)
-    disp_h, disp_w = preview.shape[:2]
-    orig_h, orig_w = image_bgr.shape[:2]
-    scale_x = orig_w / disp_w
-    scale_y = orig_h / disp_h
-
-    marker_corners, marker_center = detect_first_aruco_geometry(image_bgr)
-    default_x0, default_y0, default_x1, default_y1 = compute_default_roi_box(
-        image_bgr.shape, marker_corners, marker_center, multiplier=roi_multiplier,
-        image_bgr=image_bgr, use_plant_detection=use_plant_detection,
-    )
-    # 換算成縮圖座標，當作滑桿的預設值
-    default_disp_x = (int(default_x0 / scale_x), int(default_x1 / scale_x))
-    default_disp_y = (int(default_y0 / scale_y), int(default_y1 / scale_y))
-
-    x_range = st.slider(
-        "水平範圍（左－右）", 0, disp_w, default_disp_x, key=f"{key_prefix}_roi_x"
-    )
-    y_range = st.slider(
-        "垂直範圍（上－下）", 0, disp_h, default_disp_y, key=f"{key_prefix}_roi_y"
-    )
-
-    preview_with_box = preview.copy()
-    cv2.rectangle(preview_with_box, (x_range[0], y_range[0]), (x_range[1], y_range[1]), (0, 255, 255), 3)
-    st.image(
-        bgr_to_rgb_for_display(preview_with_box),
-        caption="黃框＝分析範圍（框外的綠色都不會計入）",
-        use_container_width=True,
-    )
-
-    x0, x1 = int(x_range[0] * scale_x), int(x_range[1] * scale_x)
-    y0, y1 = int(y_range[0] * scale_y), int(y_range[1] * scale_y)
-    return (x0, y0, x1, y1)
 
 
 def build_aruco_match_message(point_id, ids_found):
@@ -589,75 +482,6 @@ def clean_mask(mask, kernel_size=5):
     mask_clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel)
     return mask_clean
-
-
-# ----------------------------------------------------------------------------
-# 盆栽物件偵測（YOLOv8，用來讓「範圍推算」更準，取代單純用 ArUco 位置猜測）
-# 這是選用功能：套件裝不起來、模型下載失敗、或執行時出錯，都會自動退回
-# 原本「用 ArUco 位置推算」的方式，不會讓程式整個掛掉。
-# ----------------------------------------------------------------------------
-@st.cache_resource(show_spinner="首次使用需下載盆栽偵測模型，請稍候…")
-def load_plant_detection_model():
-    try:
-        from ultralytics import YOLO
-        return YOLO("yolov8n.pt")
-    except Exception:
-        return None
-
-
-def detect_potted_plant_roi(image_bgr, marker_center=None, conf_threshold=0.25, padding_ratio=0.15):
-    """
-    用 YOLOv8 預訓練模型（COCO 的 "potted plant" 類別）偵測照片中的盆栽，
-    回傳 (roi, all_boxes, message)：
-        roi：(x0, y0, x1, y1) 選定的分析範圍（已加上邊界留白），偵測失敗時為 None
-        all_boxes：偵測到的所有盆栽框（含信心值），供除錯/顯示用
-        message：給使用者看的狀態說明文字
-    若畫面中有多個盆栽，優先選離 ArUco 標記最近的一個（標記本來就貼在該點位盆栽最外側）；
-    沒有標記位置資訊的話，改選面積最大的框。
-    """
-    model = load_plant_detection_model()
-    if model is None:
-        return None, [], "盆栽偵測模型尚未安裝或載入失敗"
-
-    try:
-        results = model.predict(image_bgr, verbose=False, conf=conf_threshold)
-    except Exception as e:
-        return None, [], f"盆栽偵測執行失敗（{e}）"
-
-    boxes = []
-    for r in results:
-        for box in r.boxes:
-            cls_id = int(box.cls[0])
-            cls_name = model.names.get(cls_id, "")
-            if cls_name == "potted plant":
-                xyxy = box.xyxy[0].tolist()
-                conf = float(box.conf[0])
-                boxes.append((xyxy[0], xyxy[1], xyxy[2], xyxy[3], conf))
-
-    if not boxes:
-        return None, [], "這張照片沒有偵測到盆栽"
-
-    if marker_center is not None:
-        mx, my = marker_center
-
-        def _dist(b):
-            cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
-            return (cx - mx) ** 2 + (cy - my) ** 2
-
-        chosen = min(boxes, key=_dist)
-    else:
-        chosen = max(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
-
-    x0, y0, x1, y1, conf = chosen
-    h, w = image_bgr.shape[:2]
-    bw, bh = x1 - x0, y1 - y0
-    x0 = max(0, x0 - bw * padding_ratio)
-    y0 = max(0, y0 - bh * padding_ratio)
-    x1 = min(w, x1 + bw * padding_ratio)
-    y1 = min(h, y1 + bh * padding_ratio)
-    roi = (int(x0), int(y0), int(x1), int(y1))
-    message = f"✅ 已用 YOLOv8 偵測到盆栽（信心值 {conf:.2f}）"
-    return roi, boxes, message
 
 
 def compute_green_area_m2(mask, pixels_per_cm):
@@ -1164,133 +988,8 @@ def main():
     st.title("🌿 街道非正式綠化（盆栽佔用）現場調查分析系統")
     st.caption("電腦視覺（ArUco 比例尺校正 + 植生遮罩擷取）× 環境行為學空間數據分析")
 
-    # ==========================================================
-    # 側邊欄：現場照片上傳 + 點位屬性表單（可隱藏）+ 影像分析參數（常駐）
-    # ==========================================================
-    with st.sidebar:
-        toggle_label = "🙈 隱藏左側點位表單" if st.session_state.show_manual_form else "👁️ 顯示左側點位表單（單筆手動輸入用）"
-        if st.button(toggle_label, use_container_width=True):
-            st.session_state.show_manual_form = not st.session_state.show_manual_form
-            st.rerun()
-
-        if st.session_state.show_manual_form:
-            st.header("📷 現場照片上傳")
-            uploaded_file = st.file_uploader("上傳單張現場調查照片（JPG / PNG）", type=["jpg", "jpeg", "png"])
-
-            ids_found = []
-            preview_bgr = None
-            if uploaded_file is not None:
-                try:
-                    preview_bytes = uploaded_file.getvalue()
-                    preview_pil = Image.open(io.BytesIO(preview_bytes))
-                    preview_bgr = pil_to_bgr(preview_pil)
-                    ids_found, _dict_used_preview = detect_aruco_ids_only(preview_bgr)
-                    st.image(bgr_to_rgb_for_display(preview_bgr), caption="已上傳照片預覽", use_container_width=True)
-                except Exception:
-                    st.error("照片讀取失敗，請確認檔案格式")
-
-            if uploaded_file is not None:
-                if ids_found:
-                    st.success(f"📷 已偵測到 ArUco，ID：{'、'.join(str(i) for i in ids_found)}")
-                else:
-                    st.warning("📷 未偵測到 ArUco 標記，請確認畫面中是否有清楚拍到")
-
-            with st.expander("📏 名詞說明（拍照距離 / 占用深度 / ArUco 擺放位置）"):
-                st.markdown(
-                    "- **拍照距離**：相機鏡頭到「建築外牆」的距離。\n"
-                    "- **盆栽占用深度**：盆栽最外側（含枝條葉子）到「建築外牆」的距離。\n"
-                    "- **ArUco 擺放位置**：請貼放在該點位「盆栽最外側」處，做為比例尺換算的基準，"
-                    "確保面積／高度換算與占用深度的量測基準一致。"
-                )
-
-            st.divider()
-            st.caption("以下欄位填寫時不會立即重新整理，全部填好後按最下方「執行影像分析」才會一次讀取。")
-
-            with st.form("point_attribute_form", clear_on_submit=False):
-                st.header("📋 點位屬性輸入")
-
-                mrt_station = st.text_input("捷運站", placeholder="請手動輸入，例如：忠孝復興站")
-                point_id = st.text_input("點位編號（Point ID）", value="")
-
-                shooting_distance = st.number_input(
-                    "拍照距離（公尺，以 0.5m 為單位）",
-                    min_value=0.5, max_value=50.0, value=3.0, step=0.5, format="%.1f",
-                    help="相機鏡頭到「建築外牆」的距離。",
-                )
-
-                location_type_raw = st.selectbox("擺放位置", LOCATION_OPTIONS)
-                location_type_other = st.text_input(
-                    "若擺放位置選「其他」，請在這裡填寫", key="location_other",
-                    help="僅在上方「擺放位置」選擇『其他』時才會使用這裡填寫的內容。",
-                )
-
-                arrangement_type = st.selectbox("盆栽擺放型態", ARRANGEMENT_OPTIONS)
-
-                st.markdown("**現場實測最高高度（公分）— 依擺放方式分別填寫**")
-                h1, h2, h3 = st.columns(3)
-                with h1:
-                    floor_height_cm = st.number_input("落地擺放", min_value=0.0, max_value=500.0, value=0.0, step=1.0, key="floor_h")
-                with h2:
-                    hanging_height_cm = st.number_input("吊掛擺放", min_value=0.0, max_value=500.0, value=0.0, step=1.0, key="hang_h")
-                with h3:
-                    upward_height_cm = st.number_input("向上擺放", min_value=0.0, max_value=500.0, value=0.0, step=1.0, key="up_h")
-
-                occupancy_depth_cm = st.number_input(
-                    "盆栽占用深度（公分）", min_value=0.0, max_value=500.0, value=0.0, step=1.0,
-                    help="盆栽最外側（含枝條葉子）到「建築外牆」的距離。",
-                )
-
-                st.markdown("**盆栽擺放數量（盆）**")
-                q1, q2, q3, q4 = st.columns(4)
-                with q1:
-                    floor_qty = st.number_input("落地", min_value=0, value=0, step=1, key="floor_q")
-                with q2:
-                    hanging_qty = st.number_input("吊掛", min_value=0, value=0, step=1, key="hang_q")
-                with q3:
-                    upward_qty = st.number_input("向上", min_value=0, value=0, step=1, key="up_q")
-                with q4:
-                    empty_qty = st.number_input("空盆栽", min_value=0, value=0, step=1, key="empty_q")
-
-                st.caption("（數量合計會在按下「執行影像分析」後，於下方結果中顯示）")
-
-                note_text = st.text_area("附註（選填）", value="", placeholder="其他需要記錄的現場觀察...")
-
-                marker_real_length_cm = st.number_input(
-                    "ArUco 實際邊長（公分）", min_value=1.0, max_value=100.0, value=20.0, step=0.5,
-                    help="ArUco 標記本身的實際邊長，貼放於該點位盆栽最外側，作為比例尺校正基準。",
-                )
-
-                run_analysis = st.form_submit_button("🚀 執行影像分析", use_container_width=True, type="primary")
-
-            if location_type_raw == "其他":
-                location_type_final = location_type_other.strip() if location_type_other.strip() else "其他（未填寫）"
-            else:
-                location_type_final = location_type_raw
-
-            total_qty_excl_empty = floor_qty + hanging_qty + upward_qty
-        else:
-            st.info(
-                "已隱藏「照片上傳／點位屬性表單」（單筆手動輸入用）。"
-                "如果你要用主畫面下方的「批次匯入」功能，不需要叫出這裡；"
-                "有需要手動輸入單筆資料時，再按上方按鈕叫出來。"
-            )
-            uploaded_file = None
-            ids_found = []
-            preview_bgr = None
-            mrt_station = ""
-            point_id = ""
-            shooting_distance = 3.0
-            location_type_final = LOCATION_OPTIONS[0]
-            arrangement_type = ARRANGEMENT_OPTIONS[0]
-            floor_height_cm = hanging_height_cm = upward_height_cm = 0.0
-            occupancy_depth_cm = 0.0
-            floor_qty = hanging_qty = upward_qty = empty_qty = 0
-            total_qty_excl_empty = 0
-            note_text = ""
-            marker_real_length_cm = 20.0
-            run_analysis = False
-
-        st.divider()
+    st.divider()
+    with st.expander("🎨 影像分析參數設定", expanded=False):
         st.header("🎨 影像分析參數")
         st.caption("這裡的設定不受上面表單顯示/隱藏影響，單筆分析與批次分析都會套用。")
 
@@ -1315,50 +1014,112 @@ def main():
         )
 
         st.divider()
-        st.markdown("**🌿 盆栽範圍限制（排除背景街景干擾）**")
-        roi_restriction_enabled = st.checkbox(
-            "啟用範圍限制（只分析框選/推算範圍內的綠色，範圍外一律忽略）",
-            value=False,
-            help="開啟後，單筆分析與批次逐筆分析時可以用滑桿手動框選盆栽大概的範圍；"
-                 "批次自動比對照片時沒辦法一張張手動框，會直接用下面選的方式自動推算範圍。",
-        )
-        use_plant_detection = False
-        if roi_restriction_enabled:
-            use_plant_detection = st.checkbox(
-                "🔍 用 YOLOv8 自動偵測盆栽位置（比較準，但需要額外套件）",
-                value=False,
-                help="開啟後，會先嘗試用物件偵測模型實際找出照片中的盆栽位置來當作預設範圍；"
-                     "如果套件沒裝好、模型載入失敗、或這張照片沒偵測到盆栽，"
-                     "會自動退回下面「用 ArUco 位置推算」的方式，不會中斷分析。"
-                     "畫面中有多個盆栽時，會優先選離 ArUco 標記最近的那一個。",
-            )
-        roi_multiplier = st.slider(
-            "自動推算範圍的倍數（以 ArUco 邊長為單位）", 2.0, 15.0, 6.0, step=0.5,
-            help="當 YOLOv8 沒有開啟、或沒有偵測到盆栽時，會以 ArUco 標記為中心，"
-                 "往外延伸「標記邊長 × 這個倍數」的範圍當作預設的分析範圍。倍數越大，涵蓋的範圍越大。",
-        )
-
-        single_entry_roi = None
-        if roi_restriction_enabled and uploaded_file is not None and preview_bgr is not None:
-            st.caption("在下方微調盆栽範圍（已自動抓好一個建議框，可以直接用滑桿調整）")
-            single_entry_roi = render_roi_box_selector(
-                preview_bgr, "single_entry_roi", roi_multiplier, max_preview_width=300,
-                use_plant_detection=use_plant_detection,
-            )
-
-        st.divider()
         manual_scale_override = st.number_input(
             "手動輸入比例尺（像素/公分）— 僅於 ArUco 未偵測到時使用，0 表示不啟用",
             min_value=0.0, value=0.0, step=0.1,
             help="當照片中沒有清楚偵測到 ArUco 標記時，可以自己估算「畫面中多少像素等於 1 公分」，手動輸入來替代自動校正。",
         )
 
+    with st.expander("✍️ 單筆輸入（照片上傳＋點位屬性表單）", expanded=False):
+        st.header("📷 現場照片上傳")
+        uploaded_file = st.file_uploader("上傳單張現場調查照片（JPG / PNG）", type=["jpg", "jpeg", "png"])
+
+        ids_found = []
+        if uploaded_file is not None:
+            try:
+                preview_bytes = uploaded_file.getvalue()
+                preview_pil = Image.open(io.BytesIO(preview_bytes))
+                preview_bgr = pil_to_bgr(preview_pil)
+                ids_found, _dict_used_preview = detect_aruco_ids_only(preview_bgr)
+                st.image(bgr_to_rgb_for_display(preview_bgr), caption="已上傳照片預覽", use_container_width=True)
+            except Exception:
+                st.error("照片讀取失敗，請確認檔案格式")
+
+        if uploaded_file is not None:
+            if ids_found:
+                st.success(f"📷 已偵測到 ArUco，ID：{'、'.join(str(i) for i in ids_found)}")
+            else:
+                st.warning("📷 未偵測到 ArUco 標記，請確認畫面中是否有清楚拍到")
+
+        st.caption(
+            "📏 名詞說明：**拍照距離**＝相機鏡頭到「建築外牆」的距離；"
+            "**盆栽占用深度**＝盆栽最外側（含枝條葉子）到「建築外牆」的距離；"
+            "**ArUco 擺放位置**請貼放在該點位「盆栽最外側」處，做為比例尺換算的基準，"
+            "確保面積／高度換算與占用深度的量測基準一致。"
+        )
+
+        st.divider()
+        st.caption("以下欄位填寫時不會立即重新整理，全部填好後按最下方「執行影像分析」才會一次讀取。")
+
+        with st.form("point_attribute_form", clear_on_submit=False):
+            st.header("📋 點位屬性輸入")
+
+            mrt_station = st.text_input("捷運站", placeholder="請手動輸入，例如：忠孝復興站")
+            point_id = st.text_input("點位編號（Point ID）", value="")
+
+            shooting_distance = st.number_input(
+                "拍照距離（公尺，以 0.5m 為單位）",
+                min_value=0.5, max_value=50.0, value=3.0, step=0.5, format="%.1f",
+                help="相機鏡頭到「建築外牆」的距離。",
+            )
+
+            location_type_raw = st.selectbox("擺放位置", LOCATION_OPTIONS)
+            location_type_other = st.text_input(
+                "若擺放位置選「其他」，請在這裡填寫", key="location_other",
+                help="僅在上方「擺放位置」選擇『其他』時才會使用這裡填寫的內容。",
+            )
+
+            arrangement_type = st.selectbox("盆栽擺放型態", ARRANGEMENT_OPTIONS)
+
+            st.markdown("**現場實測最高高度（公分）— 依擺放方式分別填寫**")
+            h1, h2, h3 = st.columns(3)
+            with h1:
+                floor_height_cm = st.number_input("落地擺放", min_value=0.0, max_value=500.0, value=0.0, step=1.0, key="floor_h")
+            with h2:
+                hanging_height_cm = st.number_input("吊掛擺放", min_value=0.0, max_value=500.0, value=0.0, step=1.0, key="hang_h")
+            with h3:
+                upward_height_cm = st.number_input("向上擺放", min_value=0.0, max_value=500.0, value=0.0, step=1.0, key="up_h")
+
+            occupancy_depth_cm = st.number_input(
+                "盆栽占用深度（公分）", min_value=0.0, max_value=500.0, value=0.0, step=1.0,
+                help="盆栽最外側（含枝條葉子）到「建築外牆」的距離。",
+            )
+
+            st.markdown("**盆栽擺放數量（盆）**")
+            q1, q2, q3, q4 = st.columns(4)
+            with q1:
+                floor_qty = st.number_input("落地", min_value=0, value=0, step=1, key="floor_q")
+            with q2:
+                hanging_qty = st.number_input("吊掛", min_value=0, value=0, step=1, key="hang_q")
+            with q3:
+                upward_qty = st.number_input("向上", min_value=0, value=0, step=1, key="up_q")
+            with q4:
+                empty_qty = st.number_input("空盆栽", min_value=0, value=0, step=1, key="empty_q")
+
+            st.caption("（數量合計會在按下「執行影像分析」後，於下方結果中顯示）")
+
+            note_text = st.text_area("附註（選填）", value="", placeholder="其他需要記錄的現場觀察...")
+
+            marker_real_length_cm = st.number_input(
+                "ArUco 實際邊長（公分）", min_value=1.0, max_value=100.0, value=20.0, step=0.5,
+                help="ArUco 標記本身的實際邊長，貼放於該點位盆栽最外側，作為比例尺校正基準。",
+            )
+
+            run_analysis = st.form_submit_button("🚀 執行影像分析", use_container_width=True, type="primary")
+
+        if location_type_raw == "其他":
+            location_type_final = location_type_other.strip() if location_type_other.strip() else "其他（未填寫）"
+        else:
+            location_type_final = location_type_raw
+
+        total_qty_excl_empty = floor_qty + hanging_qty + upward_qty
+
     # ==========================================================
     # 主畫面：影像分析流程（初次分析）
     # ==========================================================
     if run_analysis:
         if uploaded_file is None:
-            st.error("請先於左側面板上傳一張現場調查照片。")
+            st.error("請先在上方「✍️ 單筆輸入」區塊裡上傳一張現場調查照片。")
         else:
             pil_image = Image.open(uploaded_file)
             image_bgr = pil_to_bgr(pil_image)
@@ -1372,7 +1133,7 @@ def main():
                 scale_source = f"ArUco 自動偵測（字典：{dict_used}，ID：{marker_id}）"
                 st.success(f"✅ 成功偵測到 ArUco Marker（{dict_used}，ID={marker_id}），比例尺 = {pixels_per_cm:.3f} px/cm")
             else:
-                st.warning("⚠️ 未偵測到任何 ArUco Marker，請於側邊欄手動輸入預估比例尺（像素/公分）。")
+                st.warning("⚠️ 未偵測到任何 ArUco Marker，請於上方「🎨 影像分析參數設定」中手動輸入預估比例尺（像素/公分）。")
                 if manual_scale_override and manual_scale_override > 0:
                     pixels_per_cm = manual_scale_override
                     scale_source = "手動輸入"
@@ -1386,17 +1147,6 @@ def main():
                 raw_mask = extract_green_mask_exg(image_bgr, exg_threshold)
 
             mask = clean_mask(raw_mask, kernel_size=morph_kernel)
-
-            if roi_restriction_enabled:
-                roi_to_apply = single_entry_roi
-                if roi_to_apply is None:
-                    # 沒有手動框選（例如關掉範圍限制後又打開、還沒重新跑出滑桿）時，退回自動推算的範圍
-                    marker_corners_r, marker_center_r = detect_first_aruco_geometry(image_bgr)
-                    roi_to_apply = compute_default_roi_box(
-                        image_bgr.shape, marker_corners_r, marker_center_r, multiplier=roi_multiplier,
-                        image_bgr=image_bgr, use_plant_detection=use_plant_detection,
-                    )
-                mask = apply_roi_to_mask(mask, roi_to_apply)
 
             match_msg, match_status = build_aruco_match_message(point_id, ids_found)
 
@@ -1550,16 +1300,6 @@ def main():
                     else:
                         raw_mask_b = extract_green_mask_exg(bulk_bgr, exg_threshold)
                     mask_b = clean_mask(raw_mask_b, kernel_size=morph_kernel)
-
-                    if roi_restriction_enabled:
-                        # 批次自動比對沒辦法一張張手動框選，直接用 ArUco 位置自動推算範圍
-                        marker_corners_rb, marker_center_rb = detect_first_aruco_geometry(bulk_bgr)
-                        roi_to_apply_b = compute_default_roi_box(
-                            bulk_bgr.shape, marker_corners_rb, marker_center_rb, multiplier=roi_multiplier,
-                            image_bgr=bulk_bgr, use_plant_detection=use_plant_detection,
-                        )
-                        mask_b = apply_roi_to_mask(mask_b, roi_to_apply_b)
-
                     computed_b = recompute_full_result(mask_b, pxcm_b, height_threshold_cm)
                     match_msg_b, match_status_b = build_aruco_match_message(
                         matched_record.get("點位編號", ""), bulk_ids_found
@@ -1661,13 +1401,6 @@ def main():
             else:
                 st.warning("📷 未偵測到 ArUco 標記")
 
-            pending_roi = None
-            if roi_restriction_enabled:
-                st.caption("🌿 微調盆栽範圍（已用 ArUco 位置預先抓好一個建議框，可以直接用滑桿調整）")
-                pending_roi = render_roi_box_selector(
-                    pending_bgr, f"pending_roi_{selected_pending_id}", roi_multiplier, max_preview_width=420
-                )
-
             if st.button("🚀 對這筆資料執行分析", type="primary", key=f"analyze_pending_{selected_pending_id}"):
                 marker_len = float(selected_record.get("ArUco邊長(cm)", 20) or 20)
                 _annotated_p, pixels_per_cm_p, _c, dict_used_p, _mc, marker_id_p = detect_aruco_marker(pending_bgr, marker_len)
@@ -1685,16 +1418,6 @@ def main():
                 else:
                     raw_mask_p = extract_green_mask_exg(pending_bgr, exg_threshold)
                 mask_p = clean_mask(raw_mask_p, kernel_size=morph_kernel)
-
-                if roi_restriction_enabled:
-                    roi_to_apply_p = pending_roi
-                    if roi_to_apply_p is None:
-                        marker_corners_rp, marker_center_rp = detect_first_aruco_geometry(pending_bgr)
-                        roi_to_apply_p = compute_default_roi_box(
-                            pending_bgr.shape, marker_corners_rp, marker_center_rp, multiplier=roi_multiplier,
-                            image_bgr=pending_bgr, use_plant_detection=use_plant_detection,
-                        )
-                    mask_p = apply_roi_to_mask(mask_p, roi_to_apply_p)
 
                 computed_p = recompute_full_result(mask_p, pixels_per_cm_p, height_threshold_cm)
                 match_msg_p, match_status_p = build_aruco_match_message(selected_record.get("點位編號", ""), pending_ids_found)
@@ -1890,13 +1613,6 @@ def main():
                                 else:
                                     raw_mask_h = extract_green_mask_exg(loaded_bgr, exg_threshold)
                                 mask_h = clean_mask(raw_mask_h, kernel_size=morph_kernel)
-                                if roi_restriction_enabled:
-                                    marker_corners_rh, marker_center_rh = detect_first_aruco_geometry(loaded_bgr)
-                                    roi_to_apply_h = compute_default_roi_box(
-                                        loaded_bgr.shape, marker_corners_rh, marker_center_rh, multiplier=roi_multiplier,
-                                        image_bgr=loaded_bgr, use_plant_detection=use_plant_detection,
-                                    )
-                                    mask_h = apply_roi_to_mask(mask_h, roi_to_apply_h)
 
                             # 比例尺優先沿用這筆紀錄原本存的像素/公分比例尺；沒有的話才重新偵測 ArUco
                             stored_scale = None
