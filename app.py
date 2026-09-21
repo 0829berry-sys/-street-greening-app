@@ -1587,9 +1587,50 @@ def main():
                         new_bgr = pil_to_bgr(new_pil)
                         new_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         new_filename = save_photo_file(new_bgr, selected_point, new_ts)
-                        st.session_state.dataframe.at[record_index, "照片檔名"] = new_filename
+
+                        # 照片換了，遮罩跟依賴照片算出來的數字（面積、高度、比例尺…）都要重新分析，
+                        # 不能沿用舊照片的遮罩，否則遮罩會跟新照片對不上。
+                        new_ids_found, _ = detect_aruco_ids_only(new_bgr)
+                        marker_len_new = float(record.get("ArUco邊長(cm)", 20) or 20)
+                        _ann_new, pxcm_new, _c, dict_used_new, _mc, marker_id_new = detect_aruco_marker(
+                            new_bgr, marker_len_new
+                        )
+                        if pxcm_new is not None:
+                            scale_source_new = f"ArUco 自動偵測（字典：{dict_used_new}，ID：{marker_id_new}）"
+                        else:
+                            scale_source_new = "未提供（無法換算實際面積/高度，可到「載入這張照片以編輯遮罩」手動補比例尺）"
+
+                        if green_method == "HSV 色彩閾值":
+                            raw_mask_new = extract_green_mask_hsv(new_bgr, h_low, h_high, s_low, v_low)
+                        else:
+                            raw_mask_new = extract_green_mask_exg(new_bgr, exg_threshold)
+                        mask_new = clean_mask(raw_mask_new, kernel_size=morph_kernel)
+                        computed_new = recompute_full_result(mask_new, pxcm_new, height_threshold_cm)
+                        match_msg_new, match_status_new = build_aruco_match_message(selected_point, new_ids_found)
+
+                        existing_mask_filename = record.get("遮罩檔名", "")
+                        new_mask_filename = save_mask_file(
+                            mask_new, selected_point, new_ts,
+                            existing_filename=existing_mask_filename if existing_mask_filename else None,
+                        )
+
+                        df_ss = st.session_state.dataframe
+                        df_ss.at[record_index, "照片檔名"] = new_filename
+                        df_ss.at[record_index, "遮罩檔名"] = new_mask_filename
+                        df_ss.at[record_index, "ArUco偵測ID"] = "、".join(str(i) for i in new_ids_found) if new_ids_found else ""
+                        df_ss.at[record_index, "編號比對結果"] = match_status_new
+                        df_ss.at[record_index, "比例尺來源"] = scale_source_new
+                        df_ss.at[record_index, "像素/公分比例尺"] = round(pxcm_new, 4) if pxcm_new else None
+                        df_ss.at[record_index, "AI辨識綠化面積(m2)"] = (
+                            round(computed_new["area_m2"], 4) if computed_new["area_m2"] is not None else None
+                        )
+                        df_ss.at[record_index, "左區高度(cm)"] = computed_new["zone_heights_cm"].get("left")
+                        df_ss.at[record_index, "中區高度(cm)"] = computed_new["zone_heights_cm"].get("mid")
+                        df_ss.at[record_index, "右區高度(cm)"] = computed_new["zone_heights_cm"].get("right")
+                        df_ss.at[record_index, "高低型態判定"] = computed_new["shape_label"]
+                        st.session_state.dataframe = df_ss
                         save_local_data(st.session_state.dataframe)
-                        st.success("照片已更新！")
+                        st.success("照片已更新，並已依新照片重新分析遮罩與各項數值！")
                         st.rerun()
 
                 if photo_filename and os.path.exists(photo_path):
