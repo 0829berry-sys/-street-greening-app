@@ -94,6 +94,9 @@ DATAFRAME_COLUMNS = [
     "左區高度(cm)",
     "中區高度(cm)",
     "右區高度(cm)",
+    "左中相對高度差(%)",
+    "中右相對高度差(%)",
+    "高度關係序列",
     "高低型態判定",
     "照片檔名",
     "遮罩檔名",
@@ -115,6 +118,8 @@ NUMERIC_COLS_FOR_STATS = [
     "左區高度(cm)",
     "中區高度(cm)",
     "右區高度(cm)",
+    "左中相對高度差(%)",
+    "中右相對高度差(%)",
 ]
 
 CATEGORICAL_COLS_FOR_STATS = ["擺放位置", "盆栽擺放型態", "高低型態判定"]
@@ -127,7 +132,6 @@ ARUCO_DICT_CANDIDATES = {
     "DICT_6X6_250": cv2.aruco.DICT_6X6_250,
 }
 
-HEIGHT_LEVEL_THRESHOLD_DEFAULT = 5.0  # 公分，判斷「高/低」是否有顯著落差的閾值
 
 LOCATION_OPTIONS = ["路邊", "門口", "路口轉角", "騎樓", "其他"]
 ARRANGEMENT_OPTIONS = ["橫向擺放", "直列擺放", "群聚擺放", "單盆擺放"]
@@ -345,8 +349,10 @@ def init_session_state():
         st.session_state.canvas_key_counter = 0
     if "mask_before_editing" not in st.session_state:
         st.session_state.mask_before_editing = None
-    if "height_threshold_cm" not in st.session_state:
-        st.session_state.height_threshold_cm = HEIGHT_LEVEL_THRESHOLD_DEFAULT
+    if "flat_threshold_percent" not in st.session_state:
+        st.session_state.flat_threshold_percent = FLAT_THRESHOLD_PERCENT_DEFAULT
+    if "significant_threshold_percent" not in st.session_state:
+        st.session_state.significant_threshold_percent = SIGNIFICANT_THRESHOLD_PERCENT_DEFAULT
     if "pending_records" not in st.session_state:
         st.session_state.pending_records = []
     if "pending_id_counter" not in st.session_state:
@@ -534,43 +540,135 @@ def analyze_zone_profile(mask, pixels_per_cm):
     return zone_heights_cm, envelope_points, (x_min, x_split1, x_split2, x_max)
 
 
-def classify_zone_shape(zone_heights_cm, threshold_cm=HEIGHT_LEVEL_THRESHOLD_DEFAULT):
+FLAT_THRESHOLD_PERCENT_DEFAULT = 10.0        # % 相對高度差，低於此視為「齊平」
+SIGNIFICANT_THRESHOLD_PERCENT_DEFAULT = 20.0  # % 相對高度差，達到此門檻才視為「明顯高低」
+
+
+def compute_relative_height_difference(h1, h2):
     """
-    依左/中/右三區高度關係，自動分類擺放立面形式（固定為 5 類，避免相近組合被拆成
-    不同類別）：
-        - 齊平型：整體高度差小於閾值，或中間高度落在左右連線的合理範圍內
-        - 凹型（高低高）：中間明顯低於左右兩側連線
-        - 拱型（低高低）：中間明顯高於左右兩側連線
-        - 遞增型（左低右高）：整體呈現由左至右升高的單調趨勢
-        - 遞減型（左高右低）：整體呈現由左至右降低的單調趨勢
+    計算兩個高度之間的「相對高度差」（百分比），以兩者的平均高度為基準：
+        relative_difference = |h1 - h2| / ((h1 + h2) / 2) * 100
+    採用相對差而非固定公分差的理論依據：視覺心理物理學中的 Weber's law 指出，
+    人眼對差異的辨識與刺激物的「相對差異」有關，而非單純取決於絕對差值
+    （Morgan, 2005，幾何物體之視覺尺寸辨識研究中，height discrimination 的
+    Weber fraction 約落於 5–10% 的量級）。本研究並非測量人眼最小可辨識差異，
+    而是分析街道盆栽的「排列型態」，因此以此文獻提供的量級為參考基礎，
+    依研究目的設定操作性分類閾值（見 FLAT_THRESHOLD_PERCENT / SIGNIFICANT_THRESHOLD_PERCENT），
+    而非直接主張「低於門檻人眼必定看不出差異」。
     """
-    hl, hm, hr = zone_heights_cm.get("left"), zone_heights_cm.get("mid"), zone_heights_cm.get("right")
-    if hl is None or hm is None or hr is None:
+    avg = (h1 + h2) / 2.0
+    if avg <= 0:
+        return 0.0
+    return abs(h1 - h2) / avg * 100.0
+
+
+def classify_pairwise_relationship(h1, h2, flat_threshold, significant_threshold):
+    """
+    判斷相鄰兩點的高度關係，回傳三元分類（而非直接二元判定高/低）：
+        - "FLAT"（齊平）：相對高度差 < flat_threshold
+        - "DIFFERENT"（高度差異）：flat_threshold ≤ 相對高度差 < significant_threshold
+        - "SIGNIFICANT"（明顯高低）：相對高度差 ≥ significant_threshold
+    以及方向 direction：h2 比 h1 高則為 "up"，較低則為 "down"，齊平則為 "flat"。
+    """
+    rel_diff = compute_relative_height_difference(h1, h2)
+    if rel_diff < flat_threshold:
+        state = "FLAT"
+    elif rel_diff < significant_threshold:
+        state = "DIFFERENT"
+    else:
+        state = "SIGNIFICANT"
+    direction = "flat" if state == "FLAT" else ("up" if h2 > h1 else "down")
+    return state, direction, round(rel_diff, 2)
+
+
+STATE_LABEL_ZH = {"FLAT": "齊平", "DIFFERENT": "高度差異", "SIGNIFICANT": "明顯高低"}
+DIRECTION_LABEL_ZH = {"up": "升", "down": "降", "flat": "平"}
+
+
+def analyze_height_sequence(heights, flat_threshold=FLAT_THRESHOLD_PERCENT_DEFAULT,
+                             significant_threshold=SIGNIFICANT_THRESHOLD_PERCENT_DEFAULT):
+    """
+    對一串依序排列的高度資料（本程式目前固定為 [左, 中, 右] 三點）做相鄰逐對分析，
+    並依整體的高度關係序列判斷排列型態。演算法本身支援任意長度的序列（≥2 點），
+    保留每一點的原始高度、每一對相鄰比較的相對高度差與關係狀態，供完整記錄與追溯。
+
+    回傳 dict：
+        heights：原始高度序列
+        pairwise：每一對相鄰比較的清單，各含 from_height、to_height、state、
+                  direction、relative_diff_percent
+        relationship_sequence：例如 "平→升→平→降" 的文字描述
+        pattern：最終判定的排列型態（中文名稱）
+    """
+    n = len(heights)
+    if n < 2 or any(h is None for h in heights):
+        return {"heights": heights, "pairwise": [], "relationship_sequence": "", "pattern": "資料不足（無法判定）"}
+
+    pairwise = []
+    for i in range(n - 1):
+        state, direction, rel_diff = classify_pairwise_relationship(
+            heights[i], heights[i + 1], flat_threshold, significant_threshold
+        )
+        pairwise.append({
+            "from_index": i, "to_index": i + 1,
+            "from_height": heights[i], "to_height": heights[i + 1],
+            "state": state, "direction": direction, "relative_diff_percent": rel_diff,
+        })
+
+    relationship_sequence = "→".join(DIRECTION_LABEL_ZH[p["direction"]] for p in pairwise)
+    pattern = classify_overall_height_pattern(pairwise)
+    return {"heights": heights, "pairwise": pairwise, "relationship_sequence": relationship_sequence, "pattern": pattern}
+
+
+def classify_overall_height_pattern(pairwise):
+    """
+    依相鄰逐對的關係序列，判斷整體排列型態。支援以下 7 類（依研究需求整理，
+    避免相近型態重複拆分）：
+        齊平型 / 遞增型 / 遞減型 / 中央高起型 / 中央低谷型 / 交錯型 / 不規則型
+    注意：僅在相鄰比較至少有一段達到「明顯高低（SIGNIFICANT）」時，才會判定為
+    遞增/遞減/中央高起/中央低谷/交錯型；只有「高度差異（DIFFERENT，10–20%）」而未達
+    明顯程度的序列，不會被強迫歸類為高低型態，會落入「不規則型」，避免過度解讀
+    尚未達到明顯程度的差異。
+    """
+    if not pairwise:
         return "資料不足（無法判定）"
 
-    vals = [hl, hm, hr]
-    if max(vals) - min(vals) < threshold_cm:
+    if all(p["state"] == "FLAT" for p in pairwise):
         return "齊平型"
 
-    expected_mid = (hl + hr) / 2.0
-    mid_deviation = hm - expected_mid
-    diff_lr = hl - hr
+    directions = [p["direction"] for p in pairwise]
+    has_significant = any(p["state"] == "SIGNIFICANT" for p in pairwise)
+    non_flat_directions = [d for d in directions if d != "flat"]
 
-    if mid_deviation > threshold_cm:
-        return "拱型（低高低）"
-    if mid_deviation < -threshold_cm:
-        return "凹型（高低高）"
-    if diff_lr > threshold_cm:
-        return "遞減型（左高右低）"
-    if diff_lr < -threshold_cm:
-        return "遞增型（左低右高）"
-    return "齊平型"
+    # 全程同方向（忽略齊平的段落）且至少一段達到明顯程度 → 單調遞增／遞減
+    if non_flat_directions and len(set(non_flat_directions)) == 1 and has_significant:
+        return "遞增型" if non_flat_directions[0] == "up" else "遞減型"
+
+    # 計算方向反轉次數（只看非齊平的段落）
+    direction_changes = 0
+    last_dir = None
+    for d in directions:
+        if d == "flat":
+            continue
+        if last_dir is not None and d != last_dir:
+            direction_changes += 1
+        last_dir = d
+
+    # 恰好一次反轉：先升後降＝中央高起；先降後升＝中央低谷
+    if direction_changes == 1 and has_significant:
+        return "中央高起型" if non_flat_directions[0] == "up" else "中央低谷型"
+
+    # 兩次以上反轉（上下上下…）＝交錯型；三點（左中右）架構下理論上不會出現，
+    # 保留給未來若擴充到更多分區時使用
+    if direction_changes >= 2 and has_significant:
+        return "交錯型"
+
+    return "不規則型"
 
 
 # ----------------------------------------------------------------------------
 # 繪製立面輪廓與分區示意圖
 # ----------------------------------------------------------------------------
-def draw_envelope_visualization(image_bgr, envelope_points, x_bounds, zone_heights_cm):
+def draw_envelope_visualization(image_bgr, envelope_points, x_bounds, zone_heights_cm, pairwise=None):
     vis = image_bgr.copy()
     h, w = vis.shape[:2]
 
@@ -597,6 +695,15 @@ def draw_envelope_visualization(image_bgr, envelope_points, x_bounds, zone_heigh
         text = f"{name}: {val}cm" if val is not None else f"{name}: N/A"
         cv2.putText(vis, text, (max(cx - 60, 5), 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+
+    # 在左中、中右分隔線附近標註相對高度差（%），對應相對高度差的判定基準（非固定公分差）
+    if pairwise:
+        split_xs = [x_split1, x_split2]
+        for p, split_x in zip(pairwise, split_xs):
+            state_tag = {"FLAT": "齊平", "DIFFERENT": "差異", "SIGNIFICANT": "明顯"}.get(p["state"], "")
+            diff_text = f"Δ{p['relative_diff_percent']}%（{state_tag}）"
+            cv2.putText(vis, diff_text, (max(split_x - 55, 5), h - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2, cv2.LINE_AA)
 
     return vis
 
@@ -731,10 +838,15 @@ def parse_template_excel(file_bytes):
 # ----------------------------------------------------------------------------
 # 從目前的 mask 與比例尺，重新計算完整分析結果（初次分析與筆刷編輯後皆呼叫此函式）
 # ----------------------------------------------------------------------------
-def recompute_full_result(mask, pixels_per_cm, height_threshold_cm):
+def recompute_full_result(mask, pixels_per_cm, flat_threshold_percent, significant_threshold_percent):
     area_m2, green_pixel_count = compute_green_area_m2(mask, pixels_per_cm)
     zone_heights_cm, envelope_points, x_bounds = analyze_zone_profile(mask, pixels_per_cm)
-    shape_label = classify_zone_shape(zone_heights_cm, threshold_cm=height_threshold_cm)
+    height_sequence = analyze_height_sequence(
+        [zone_heights_cm.get("left"), zone_heights_cm.get("mid"), zone_heights_cm.get("right")],
+        flat_threshold=flat_threshold_percent,
+        significant_threshold=significant_threshold_percent,
+    )
+    shape_label = height_sequence["pattern"]
     return {
         "area_m2": area_m2,
         "green_pixel_count": green_pixel_count,
@@ -742,7 +854,17 @@ def recompute_full_result(mask, pixels_per_cm, height_threshold_cm):
         "envelope_points": envelope_points,
         "x_bounds": x_bounds,
         "shape_label": shape_label,
+        "height_sequence": height_sequence,
     }
+
+
+def extract_height_sequence_fields(computed):
+    """從 recompute_full_result 的結果中取出左中／中右相對高度差（%）與關係序列文字，供存檔使用。"""
+    hs = computed.get("height_sequence", {})
+    pairwise = hs.get("pairwise", [])
+    lm_diff = pairwise[0]["relative_diff_percent"] if len(pairwise) > 0 else None
+    mr_diff = pairwise[1]["relative_diff_percent"] if len(pairwise) > 1 else None
+    return lm_diff, mr_diff, hs.get("relationship_sequence", "")
 
 
 def render_result_visuals(image_bgr, mask, computed):
@@ -750,7 +872,8 @@ def render_result_visuals(image_bgr, mask, computed):
     mask_overlay[mask > 0] = (0, 255, 0)
     mask_blend = cv2.addWeighted(image_bgr, 0.5, mask_overlay, 0.5, 0)
     envelope_vis = draw_envelope_visualization(
-        image_bgr, computed["envelope_points"], computed["x_bounds"], computed["zone_heights_cm"]
+        image_bgr, computed["envelope_points"], computed["x_bounds"], computed["zone_heights_cm"],
+        pairwise=computed.get("height_sequence", {}).get("pairwise"),
     )
 
     st.subheader("🖼️ 影像分析視覺化比對")
@@ -769,6 +892,19 @@ def render_result_visuals(image_bgr, mask, computed):
     m2.metric("擺放形式判定", computed["shape_label"])
     m3.metric("綠色像素數", f"{computed['green_pixel_count']:,}")
     m4.metric("左/中/右高度(cm)", f"{zh.get('left')}/{zh.get('mid')}/{zh.get('right')}")
+
+    height_sequence = computed.get("height_sequence", {})
+    pairwise = height_sequence.get("pairwise", [])
+    if pairwise:
+        st.caption(
+            "相對高度差（依平均高度為基準，非固定公分差）："
+            + "，".join(
+                f"{'左-中' if p['from_index'] == 0 else '中-右'}："
+                f"{p['relative_diff_percent']}%（{STATE_LABEL_ZH[p['state']]}）"
+                for p in pairwise
+            )
+            + f"　｜　關係序列：{height_sequence.get('relationship_sequence', '')}"
+        )
 
 
 # ----------------------------------------------------------------------------
@@ -829,13 +965,18 @@ def _render_mask_editor_body():
             final_computed = recompute_full_result(
                 st.session_state.current_mask,
                 st.session_state.current_pixels_per_cm,
-                st.session_state.height_threshold_cm,
+                st.session_state.flat_threshold_percent,
+                st.session_state.significant_threshold_percent,
             )
             lr = st.session_state.last_result
             lr["AI辨識綠化面積(m2)"] = round(final_computed["area_m2"], 4) if final_computed["area_m2"] is not None else None
             lr["左區高度(cm)"] = final_computed["zone_heights_cm"].get("left")
             lr["中區高度(cm)"] = final_computed["zone_heights_cm"].get("mid")
             lr["右區高度(cm)"] = final_computed["zone_heights_cm"].get("right")
+            _lm_e, _mr_e, _seq_e = extract_height_sequence_fields(final_computed)
+            lr["左中相對高度差(%)"] = _lm_e
+            lr["中右相對高度差(%)"] = _mr_e
+            lr["高度關係序列"] = _seq_e
             lr["高低型態判定"] = final_computed["shape_label"]
             st.session_state.last_result = lr
             st.session_state.editing_mode = False
@@ -887,7 +1028,8 @@ def render_active_result_panel():
         computed = recompute_full_result(
             st.session_state.current_mask,
             st.session_state.current_pixels_per_cm,
-            st.session_state.height_threshold_cm,
+            st.session_state.flat_threshold_percent,
+            st.session_state.significant_threshold_percent,
         )
         render_result_visuals(st.session_state.current_image_bgr, st.session_state.current_mask, computed)
         st.caption(f"ArUco 編號比對：{st.session_state.last_result.get('編號比對結果', '')}")
@@ -1014,9 +1156,24 @@ def main():
             "形態學去雜訊核大小", 1, 15, 5, step=2,
             help="用來去除遮罩上的小雜點、填補小空洞的運算範圍，數值越大平滑效果越強，但也可能抹掉細小的植栽枝葉。",
         )
-        height_threshold_cm = st.slider(
-            "高低型態判定閾值（公分）", 1.0, 20.0, HEIGHT_LEVEL_THRESHOLD_DEFAULT, step=0.5,
-            help="左/中/右三區高度要相差多少公分以上，才會被視為有明顯的「高、低」差異，藉此判斷擺放立面形式。",
+
+        st.markdown("**高低型態判定基準（相對高度差，非固定公分數）**")
+        st.caption(
+            "採用「相對高度差」而非固定公分差：relative_difference = |H1−H2| ÷ ((H1+H2)÷2) × 100%。"
+            "理論依據：視覺心理物理學之 Weber's law 指出，差異辨識與刺激物的相對差異有關，"
+            "而非單純取決於絕對差值（Morgan, 2005，height discrimination 之 Weber fraction 約 5–10%）。"
+            "本研究並非測量人眼最小可辨識差異，而是依此文獻量級為參考，"
+            "依研究目的設定以下操作性分類閾值，用於分析街道盆栽的排列型態。"
+        )
+        flat_threshold_percent = st.slider(
+            "FLAT_THRESHOLD：齊平／高度差異 的分界（%）", 1.0, 30.0, FLAT_THRESHOLD_PERCENT_DEFAULT, step=0.5,
+            help="相對高度差低於這個百分比，視為視覺上近似齊平。",
+        )
+        significant_threshold_percent = st.slider(
+            "SIGNIFICANT_THRESHOLD：高度差異／明顯高低 的分界（%）",
+            max(flat_threshold_percent + 0.5, 1.0), 60.0, max(SIGNIFICANT_THRESHOLD_PERCENT_DEFAULT, flat_threshold_percent + 0.5), step=0.5,
+            help="相對高度差達到這個百分比以上，才視為「明顯高低」，會被用來判定遞增/遞減/中央高起/中央低谷等排列型態；"
+                 "介於兩個閾值之間的視為「高度差異」，不會被強迫歸類為高低型態。",
         )
 
         st.divider()
@@ -1161,11 +1318,12 @@ def main():
             st.session_state.current_image_bgr = image_bgr
             st.session_state.current_mask = mask
             st.session_state.current_pixels_per_cm = pixels_per_cm
-            st.session_state.height_threshold_cm = height_threshold_cm
+            st.session_state.flat_threshold_percent = flat_threshold_percent
+            st.session_state.significant_threshold_percent = significant_threshold_percent
             st.session_state.editing_mode = False
             st.session_state.canvas_key_counter += 1
 
-            computed = recompute_full_result(mask, pixels_per_cm, height_threshold_cm)
+            computed = recompute_full_result(mask, pixels_per_cm, flat_threshold_percent, significant_threshold_percent)
 
             st.session_state.last_result = {
                 "捷運站": mrt_station,
@@ -1192,6 +1350,9 @@ def main():
                 "左區高度(cm)": computed["zone_heights_cm"].get("left"),
                 "中區高度(cm)": computed["zone_heights_cm"].get("mid"),
                 "右區高度(cm)": computed["zone_heights_cm"].get("right"),
+                "左中相對高度差(%)": extract_height_sequence_fields(computed)[0],
+                "中右相對高度差(%)": extract_height_sequence_fields(computed)[1],
+                "高度關係序列": extract_height_sequence_fields(computed)[2],
                 "高低型態判定": computed["shape_label"],
                 "照片檔名": "",
                 "遮罩檔名": "",
@@ -1306,7 +1467,7 @@ def main():
                     else:
                         raw_mask_b = extract_green_mask_exg(bulk_bgr, exg_threshold)
                     mask_b = clean_mask(raw_mask_b, kernel_size=morph_kernel)
-                    computed_b = recompute_full_result(mask_b, pxcm_b, height_threshold_cm)
+                    computed_b = recompute_full_result(mask_b, pxcm_b, flat_threshold_percent, significant_threshold_percent)
                     match_msg_b, match_status_b = build_aruco_match_message(
                         matched_record.get("點位編號", ""), bulk_ids_found
                     )
@@ -1345,6 +1506,9 @@ def main():
                         "左區高度(cm)": computed_b["zone_heights_cm"].get("left"),
                         "中區高度(cm)": computed_b["zone_heights_cm"].get("mid"),
                         "右區高度(cm)": computed_b["zone_heights_cm"].get("right"),
+                        "左中相對高度差(%)": extract_height_sequence_fields(computed_b)[0],
+                        "中右相對高度差(%)": extract_height_sequence_fields(computed_b)[1],
+                        "高度關係序列": extract_height_sequence_fields(computed_b)[2],
                         "高低型態判定": computed_b["shape_label"],
                         "照片檔名": photo_filename_b,
                         "遮罩檔名": mask_filename_b,
@@ -1425,7 +1589,7 @@ def main():
                     raw_mask_p = extract_green_mask_exg(pending_bgr, exg_threshold)
                 mask_p = clean_mask(raw_mask_p, kernel_size=morph_kernel)
 
-                computed_p = recompute_full_result(mask_p, pixels_per_cm_p, height_threshold_cm)
+                computed_p = recompute_full_result(mask_p, pixels_per_cm_p, flat_threshold_percent, significant_threshold_percent)
                 match_msg_p, match_status_p = build_aruco_match_message(selected_record.get("點位編號", ""), pending_ids_found)
 
                 floor_qty_p = int(float(selected_record.get("落地擺放數量", 0) or 0))
@@ -1438,7 +1602,8 @@ def main():
                 st.session_state.current_image_bgr = pending_bgr
                 st.session_state.current_mask = mask_p
                 st.session_state.current_pixels_per_cm = pixels_per_cm_p
-                st.session_state.height_threshold_cm = height_threshold_cm
+                st.session_state.flat_threshold_percent = flat_threshold_percent
+                st.session_state.significant_threshold_percent = significant_threshold_percent
                 st.session_state.editing_mode = False
                 st.session_state.canvas_key_counter += 1
                 st.session_state.active_batch_pending_id = selected_pending_id
@@ -1469,6 +1634,9 @@ def main():
                     "左區高度(cm)": computed_p["zone_heights_cm"].get("left"),
                     "中區高度(cm)": computed_p["zone_heights_cm"].get("mid"),
                     "右區高度(cm)": computed_p["zone_heights_cm"].get("right"),
+                    "左中相對高度差(%)": extract_height_sequence_fields(computed_p)[0],
+                    "中右相對高度差(%)": extract_height_sequence_fields(computed_p)[1],
+                    "高度關係序列": extract_height_sequence_fields(computed_p)[2],
                     "高低型態判定": computed_p["shape_label"],
                     "照片檔名": "",
                     "遮罩檔名": "",
@@ -1611,7 +1779,7 @@ def main():
                         else:
                             raw_mask_new = extract_green_mask_exg(new_bgr, exg_threshold)
                         mask_new = clean_mask(raw_mask_new, kernel_size=morph_kernel)
-                        computed_new = recompute_full_result(mask_new, pxcm_new, height_threshold_cm)
+                        computed_new = recompute_full_result(mask_new, pxcm_new, flat_threshold_percent, significant_threshold_percent)
                         match_msg_new, match_status_new = build_aruco_match_message(selected_point, new_ids_found)
 
                         existing_mask_filename = record.get("遮罩檔名", "")
@@ -1633,6 +1801,10 @@ def main():
                         df_ss.at[record_index, "左區高度(cm)"] = computed_new["zone_heights_cm"].get("left")
                         df_ss.at[record_index, "中區高度(cm)"] = computed_new["zone_heights_cm"].get("mid")
                         df_ss.at[record_index, "右區高度(cm)"] = computed_new["zone_heights_cm"].get("right")
+                        _lm_new, _mr_new, _seq_new = extract_height_sequence_fields(computed_new)
+                        df_ss.at[record_index, "左中相對高度差(%)"] = _lm_new
+                        df_ss.at[record_index, "中右相對高度差(%)"] = _mr_new
+                        df_ss.at[record_index, "高度關係序列"] = _seq_new if _seq_new else ""
                         df_ss.at[record_index, "高低型態判定"] = computed_new["shape_label"]
                         st.session_state.dataframe = df_ss
                         save_local_data(st.session_state.dataframe)
@@ -1676,7 +1848,8 @@ def main():
                             st.session_state.current_image_bgr = loaded_bgr
                             st.session_state.current_mask = mask_h
                             st.session_state.current_pixels_per_cm = stored_scale
-                            st.session_state.height_threshold_cm = height_threshold_cm
+                            st.session_state.flat_threshold_percent = flat_threshold_percent
+                            st.session_state.significant_threshold_percent = significant_threshold_percent
                             st.session_state.last_result = {col: record.get(col, "") for col in DATAFRAME_COLUMNS}
                             st.session_state.active_history_edit_index = record_index
                             st.session_state.active_batch_pending_id = None
