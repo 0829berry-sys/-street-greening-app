@@ -502,6 +502,58 @@ def compute_green_area_m2(mask, pixels_per_cm):
 # ----------------------------------------------------------------------------
 # 立面輪廓（Upper Envelope）左/中/右三區高度分析
 # ----------------------------------------------------------------------------
+def compute_zone_split_points(is_green, x_min, x_max):
+    """
+    決定左/中/右三區的分界點，依序嘗試：
+    1. 用連通元件（connected components）偵測遮罩是否自然分成 2～3 個明顯的植栽群塊
+       （例如盆栽彼此間有空隙），有的話直接依這些群塊的實際位置分界，而不是盲目把
+       偵測範圍切成三等份幾何寬度——避免把單一盆栽切一半、或把空隙也算進某一區。
+    2. 如果遮罩連成一片（例如植株緊靠或群聚重疊，偵測不到 2～3 個獨立群塊），改用
+       「綠色像素密度」的累積分布找分界，讓分界落在植栽實際分布的自然斷點附近
+       （內容量均分，而非幾何寬度均分）。
+    """
+    total_green_area = int(np.sum(is_green))
+    if total_green_area > 0:
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            is_green.astype(np.uint8), connectivity=8
+        )
+        min_component_area = max(total_green_area * 0.03, 20)
+        components = []
+        for label_id in range(1, num_labels):
+            area = stats[label_id, cv2.CC_STAT_AREA]
+            if area >= min_component_area:
+                x0 = stats[label_id, cv2.CC_STAT_LEFT]
+                w_comp = stats[label_id, cv2.CC_STAT_WIDTH]
+                components.append((int(x0), int(x0 + w_comp)))
+
+        if len(components) == 3:
+            components.sort(key=lambda c: c[0])
+            x_split1 = (components[0][1] + components[1][0]) // 2
+            x_split2 = (components[1][1] + components[2][0]) // 2
+            return int(x_split1), int(x_split2)
+        if len(components) == 2:
+            components.sort(key=lambda c: c[0])
+            gap_mid = (components[0][1] + components[1][0]) // 2
+            x_split1 = int(np.clip(gap_mid, x_min, x_max))
+            x_split2 = int(np.clip(gap_mid + 1, x_min, x_max))
+            return x_split1, x_split2
+
+    # 退回：以綠色像素密度的累積分布找分界（內容量均分，而非幾何寬度均分）
+    col_green_count = np.sum(is_green, axis=0).astype(np.float64)
+    segment_counts = col_green_count[x_min:x_max + 1]
+    total_green = segment_counts.sum()
+    if total_green > 0 and len(segment_counts) >= 3:
+        cumulative = np.cumsum(segment_counts)
+        idx1 = int(np.searchsorted(cumulative, total_green / 3.0))
+        idx2 = int(np.searchsorted(cumulative, 2.0 * total_green / 3.0))
+        idx1 = max(1, min(idx1, len(segment_counts) - 2))
+        idx2 = max(idx1 + 1, min(idx2, len(segment_counts) - 1))
+        return int(x_min + idx1), int(x_min + idx2)
+
+    span = x_max - x_min
+    return int(x_min + span // 3), int(x_min + 2 * span // 3)
+
+
 def analyze_zone_profile(mask, pixels_per_cm):
     h, w = mask.shape[:2]
     is_green = mask > 0
@@ -512,9 +564,7 @@ def analyze_zone_profile(mask, pixels_per_cm):
         return {"left": None, "mid": None, "right": None}, [], None
 
     x_min, x_max = int(valid_x.min()), int(valid_x.max())
-    span = x_max - x_min
-    x_split1 = x_min + span // 3
-    x_split2 = x_min + 2 * span // 3
+    x_split1, x_split2 = compute_zone_split_points(is_green, x_min, x_max)
 
     # 向量化找出每一欄最頂端（第一個非零 row）的 y 值，一次算完整張圖，
     # 取代逐欄呼叫 np.where 的迴圈（那個寫法在寬幅照片上會明顯拖慢速度）。
@@ -1130,6 +1180,29 @@ def render_active_result_panel():
 # ----------------------------------------------------------------------------
 # 主程式
 # ----------------------------------------------------------------------------
+def find_existing_point(station, point_id, df, pending_records):
+    """
+    依「先核對捷運站、再核對點位編號」檢查這個點位是否已經存在，
+    存在於已儲存的歷史紀錄，或已經在待分析清單裡都算重複。
+    """
+    station_norm = str(station).strip()
+    point_norm = str(point_id).strip()
+    if df is not None and not df.empty and "捷運站" in df.columns and "點位編號" in df.columns:
+        match = df[
+            (df["捷運站"].astype(str).str.strip() == station_norm)
+            & (df["點位編號"].astype(str).str.strip() == point_norm)
+        ]
+        if not match.empty:
+            return True
+    for rec in pending_records:
+        if (
+            str(rec.get("捷運站", "")).strip() == station_norm
+            and str(rec.get("點位編號", "")).strip() == point_norm
+        ):
+            return True
+    return False
+
+
 def main():
     init_session_state()
 
@@ -1391,12 +1464,27 @@ def main():
                 if tmpl_error:
                     st.error(tmpl_error)
                 else:
+                    added_count = 0
+                    skipped_labels = []
                     for rec in new_records:
+                        station = rec.get("捷運站", "")
+                        point_id = rec.get("點位編號", "")
+                        if find_existing_point(station, point_id, st.session_state.dataframe, st.session_state.pending_records):
+                            skipped_labels.append(f"{station}｜{point_id}")
+                            continue
                         st.session_state.pending_id_counter += 1
                         rec["_pending_id"] = st.session_state.pending_id_counter
                         st.session_state.pending_records.append(rec)
-                    st.success(f"已加入 {len(new_records)} 筆到待分析清單。")
-                    st.rerun()
+                        added_count += 1
+
+                    msg = f"已加入 {added_count} 筆到待分析清單。"
+                    if skipped_labels:
+                        msg += f" 略過 {len(skipped_labels)} 筆重複資料（同一捷運站＋點位編號已存在於歷史紀錄或待分析清單）。"
+                    st.success(msg)
+                    if skipped_labels:
+                        with st.expander(f"查看被略過的 {len(skipped_labels)} 筆重複資料（捷運站｜點位編號）"):
+                            for lbl in skipped_labels:
+                                st.write(f"- {lbl}")
 
     if st.session_state.pending_records:
         st.subheader(f"🕒 待分析清單（共 {len(st.session_state.pending_records)} 筆）")
